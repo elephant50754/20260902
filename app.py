@@ -82,7 +82,6 @@ def handle_message(event):
                 if tag == "SELL_PUT" or ratio >= 1.25:
                     candidates.append(item)
 
-            # 依 IV/HV 比值由大到小排序
             candidates.sort(key=lambda x: float(x.get("iv_hv_ratio") or 0), reverse=True)
             top_list = candidates[:15]
 
@@ -93,16 +92,22 @@ def handle_message(event):
                 reply += "----------------------\n"
                 for idx, c in enumerate(top_list, 1):
                     iv = to_pct(c.get("iv", 0))
-                    ratio = c.get("iv_hv_ratio", "N/A")
                     prem = c.get("premium", "")
-                    prem_str = f" | Put權利金:${prem}" if prem else ""
+                    spot_val = float(c.get("spot", 0) or 0)
+                    prem_str = ""
+                    if prem != "":
+                        try:
+                            p_pct = (float(prem) / spot_val * 100) if spot_val > 0 else 0
+                            prem_str = f" | Put:${prem} ({p_pct:.2f}%)"
+                        except (ValueError, TypeError):
+                            prem_str = f" | Put:${prem}"
                     reply += f"{idx}. {c['symbol']} (${c['spot']})\n"
-                    reply += f"   • IV: {iv:.1f}% | IV/HV: {ratio}x{prem_str}\n"
+                    reply += f"   • IV: {iv:.1f}%{prem_str}\n"
                 reply += "----------------------\n"
-                reply += "💡 賣方要訣：鎖定高 IV/HV 且權利金豐厚之標的，收取純時間價值。"
+                reply += "💡 賣方要訣：鎖定高 IV 且權利金%豐厚之標的，收取純時間價值。"
 
         # -------------------------------------------------------------
-        # 指令 2：Buy Call / 買方（列出低 IV、適合買方博取槓桿反彈的標的）
+        # 指令 2：Buy Call / 買方（列出低 IV、適合買方進場的標的）
         # -------------------------------------------------------------
         elif cmd in ["BUY CALL", "BUYCALL", "買方", "BUY"]:
             candidates = []
@@ -112,7 +117,6 @@ def handle_message(event):
                 if tag == "BUY_CALL" or ratio <= 0.80:
                     candidates.append(item)
 
-            # 依 IV 由小到大排序（最便宜的期權優先）
             candidates.sort(key=lambda x: to_pct(x.get("iv", 999)))
             top_list = candidates[:15]
 
@@ -123,15 +127,13 @@ def handle_message(event):
                 reply += "----------------------\n"
                 for idx, c in enumerate(top_list, 1):
                     iv = to_pct(c.get("iv", 0))
-                    hv = to_pct(c.get("hv", 0))
-                    ratio = c.get("iv_hv_ratio", "N/A")
                     reply += f"{idx}. {c['symbol']} (${c['spot']})\n"
-                    reply += f"   • IV: {iv:.1f}% (HV: {hv:.1f}%) | 比值: {ratio}x\n"
+                    reply += f"   • IV: {iv:.1f}%\n"
                 reply += "----------------------\n"
                 reply += "💡 買方要訣：IV 處於歷史低檔，合約極度便宜，適合做方向性佈局。"
 
         # -------------------------------------------------------------
-        # 指令 3：IV 區間篩選（例如輸入「IV 40-60」或「IV 30~50」）
+        # 指令 3：IV 區間篩選（例如輸入「IV 40-60」）
         # -------------------------------------------------------------
         elif re.match(r'^IV\s*(\d+(?:\.\d+)?)\s*[-~至到\s]\s*(\d+(?:\.\d+)?)$', cmd):
             match = re.match(r'^IV\s*(\d+(?:\.\d+)?)\s*[-~至到\s]\s*(\d+(?:\.\d+)?)$', cmd)
@@ -155,10 +157,8 @@ def handle_message(event):
                 reply = f"🔍【IV 介於 {low_bound}% ~ {high_bound}% 標的】(共 {len(filtered)} 檔，取前 15 檔)\n"
                 reply += "----------------------\n"
                 for idx, (iv, c) in enumerate(top_list, 1):
-                    ratio = c.get("iv_hv_ratio", "N/A")
                     strat_short = "Sell Put" if "Sell" in c.get("strategy", "") else ("Buy Call" if "Buy" in c.get("strategy", "") else "中性")
-                    reply += f"{idx}. {c['symbol']} (${c['spot']}) -> IV: {iv:.1f}%\n"
-                    reply += f"   • 比值: {ratio}x | 建議: {strat_short}\n"
+                    reply += f"{idx}. {c['symbol']} (${c['spot']}) -> IV: {iv:.1f}% | 建議: {strat_short}\n"
                 reply += "----------------------\n"
                 reply += f"💡 輸入個股代號（如 {top_list[0][1]['symbol']}）可看完整期權診斷。"
 
@@ -167,10 +167,8 @@ def handle_message(event):
         # -------------------------------------------------------------
         elif cmd in data_dict:
             data = data_dict[cmd]
+            spot_val = float(data.get('spot', 0) or 0)
             iv_val = to_pct(data.get('iv', 0))
-            hv_val = to_pct(data.get('hv', 0))
-            hv_high = to_pct(data.get('hv_52w_high', 0))
-            hv_low = to_pct(data.get('hv_52w_low', 0))
 
             strike = data.get('strike', '')
             premium = data.get('premium', '')
@@ -180,14 +178,20 @@ def handle_message(event):
             reply += "----------------------\n"
             reply += f"• 現貨股價：${data.get('spot', 0)}\n"
             reply += f"• 目前 IV：{iv_val:.2f}%\n"
-            reply += f"• 30天 HV：{hv_val:.2f}%\n"
-            reply += f"• 52週 HV 區間：{hv_low:.2f}% ~ {hv_high:.2f}%\n"
-            reply += f"• IV/HV 比值：{data.get('iv_hv_ratio', 'N/A')}x\n"
 
-            # 僅在 Sell Put 或有權利金時展示期權報價
+            # 僅在有權利金時顯示履約價、權利金金額與權利金%
             if premium != "":
+                try:
+                    prem_num = float(premium)
+                    prem_pct = (prem_num / spot_val * 100) if spot_val > 0 else 0.0
+                    prem_pct_str = f"{prem_pct:.2f}%"
+                except (ValueError, TypeError):
+                    prem_pct_str = "N/A"
+
                 reply += f"• 價外 Put 履約價：${strike}\n"
                 reply += f"• 價外 Put 權利金：${premium}\n"
+                reply += f"• 權利金%：{prem_pct_str}\n"
+
             reply += f"• 參考到期日：{exp_info}\n"
             reply += "----------------------\n"
             reply += f"💡 建議策略：\n{data.get('strategy', '')}\n"
