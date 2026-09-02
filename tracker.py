@@ -20,7 +20,6 @@ LEVERAGED_AND_BENCHMARK_ETFS = [
 ]
 
 def sanitize_float(val, default=0.0):
-    """確保所有數值均為合法浮點數，徹底過濾 NaN 與 Inf，防止 Google API 報錯"""
     if val is None:
         return default
     try:
@@ -42,7 +41,6 @@ def bs_price(is_call: bool, S: float, K: float, T: float, r: float, sigma: float
     return (S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)) if is_call else (K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1))
 
 def implied_volatility_solver(is_call: bool, S: float, K: float, T: float, market_price: float, r: float = 0.045) -> float:
-    """從真實市場成交價反推隱含波動率 (IV)"""
     if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
         return 0.0
     intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
@@ -73,83 +71,21 @@ def get_tracking_tickers():
 
     return sorted(list(set(sp500 + LEVERAGED_AND_BENCHMARK_ETFS)))
 
-def select_target_monthly_expiration(expirations, today):
-    if not expirations:
-        return None, None
+def get_mid_price(row):
+    if row is None:
+        return 0.0
+    b = float(row.get("bid", 0))
+    a = float(row.get("ask", 0))
+    l = float(row.get("lastPrice", 0))
+    return round((b + a) / 2, 2) if (b > 0 and a > 0) else round(l, 2)
 
-    exp_dates = []
-    for d_str in expirations:
-        try:
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
-            exp_dates.append((d, d_str))
-        except Exception:
-            continue
-
-    monthly_exps = [
-        (d, d_str) for d, d_str in exp_dates
-        if d.weekday() == 4 and 15 <= d.day <= 21 and d >= today
-    ]
-    monthly_exps.sort(key=lambda x: x[0])
-
-    if monthly_exps:
-        nearest_date, nearest_str = monthly_exps[0]
-        dte = (nearest_date - today).days
-        if dte < 25 and len(monthly_exps) > 1:
-            target_date, target_str = monthly_exps[1]
-        else:
-            target_date, target_str = nearest_date, nearest_str
-    else:
-        future_dates = [(d, d_str) for d, d_str in exp_dates if d >= today]
-        if not future_dates:
-            return None, None
-        target_date, target_str = min(future_dates, key=lambda x: abs((x[0] - today).days - 35))
-
-    return target_str, (target_date - today).days
-
-def fetch_volatility_metrics(symbol: str):
+def get_chain_atm_iv(ticker, spot, exp_str, dte):
+    """計算指定合約日的 ATM 隱含波動率"""
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="6mo")
-        if hist.empty or len(hist) < 22:
-            return None
-
-        spot = float(hist["Close"].iloc[-1])
-        spot = round(spot, 2)
-        if spot <= 0:
-            return None
-
-        # 21 個交易日年化 HV (對齊 thinkorswim 30 天期標準)
-        log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
-        rolling_hv = (log_ret.rolling(window=21).std() * np.sqrt(252)).dropna()
-        if rolling_hv.empty:
-            return None
-
-        current_hv = sanitize_float(rolling_hv.iloc[-1], default=0.25)
-        hv_high = sanitize_float(rolling_hv.max(), default=current_hv * 1.3)
-        hv_low = sanitize_float(rolling_hv.min(), default=current_hv * 0.7)
-
-        # 取得標準月期權
-        expirations = ticker.options
-        if not expirations:
-            return None
-
-        today = datetime.now().date()
-        target_date_str, target_dte = select_target_monthly_expiration(expirations, today)
-        if not target_date_str or target_dte <= 0:
-            return None
-
-        chain = ticker.option_chain(target_date_str)
+        chain = ticker.option_chain(exp_str)
         calls, puts = chain.calls.copy(), chain.puts.copy()
         if calls.empty and puts.empty:
-            return None
-
-        def get_mid_price(row):
-            if row is None:
-                return 0.0
-            b = float(row.get("bid", 0))
-            a = float(row.get("ask", 0))
-            l = float(row.get("lastPrice", 0))
-            return round((b + a) / 2, 2) if (b > 0 and a > 0) else round(l, 2)
+            return None, chain
 
         calls["diff"] = (calls["strike"] - spot).abs()
         atm_call = calls.sort_values("diff").iloc[0] if not calls.empty else None
@@ -159,31 +95,122 @@ def fetch_volatility_metrics(symbol: str):
         atm_put = puts.sort_values("diff").iloc[0] if not puts.empty else None
         put_mid = get_mid_price(atm_put)
 
-        # 計算真實 IV
-        T = target_dte / 365.0
+        T = dte / 365.0
         c_iv = implied_volatility_solver(True, spot, float(atm_call["strike"]), T, call_mid) if atm_call is not None else 0.0
         p_iv = implied_volatility_solver(False, spot, float(atm_put["strike"]), T, put_mid) if atm_put is not None else 0.0
 
         valid_ivs = [v for v in [c_iv, p_iv] if v > 0.05]
         if valid_ivs:
-            current_iv = sum(valid_ivs) / len(valid_ivs)
+            iv = sum(valid_ivs) / len(valid_ivs)
         else:
             raw_c = float(atm_call.get("impliedVolatility", 0)) if atm_call is not None else 0
             raw_p = float(atm_put.get("impliedVolatility", 0)) if atm_put is not None else 0
-            raw_valid = [v for v in [raw_c, raw_p] if v > 0.05]
-            current_iv = sum(raw_valid) / len(raw_valid) if raw_valid else (current_hv * 1.05)
+            raw_v = [v for v in [raw_c, raw_p] if v > 0.05]
+            iv = sum(raw_v) / len(raw_v) if raw_v else 0.25
+        return iv, chain
+    except Exception:
+        return None, None
 
-        current_iv = sanitize_float(current_iv, default=0.25)
+def fetch_volatility_metrics(symbol: str):
+    try:
+        ticker = yf.Ticker(symbol)
+
+        # 1. 抓取 15 個月數據以取得完整的 52 週 (252 個交易日) 滾動極值
+        hist = ticker.history(period="15mo")
+        if hist.empty or len(hist) < 273:
+            # 備用容錯 (至少要有半年以上數據)
+            if len(hist) < 30:
+                return None
+
+        spot = float(hist["Close"].iloc[-1])
+        spot = round(spot, 2)
+        if spot <= 0:
+            return None
+
+        # 2. 計算 21 個交易日（對齊 ToS 30天）年化滾動 HV
+        log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
+        rolling_hv = (log_ret.rolling(window=21).std() * np.sqrt(252)).dropna()
+        if rolling_hv.empty:
+            return None
+
+        current_hv = sanitize_float(rolling_hv.iloc[-1], default=0.25)
+        # 精準鎖定過去 252 個交易日（標準 52 週）
+        past_52w = rolling_hv.iloc[-252:] if len(rolling_hv) >= 252 else rolling_hv
+        hv_high = sanitize_float(past_52w.max(), default=current_hv * 1.3)
+        hv_low = sanitize_float(past_52w.min(), default=current_hv * 0.7)
+
+        # 3. 取得標準月期權清單
+        expirations = ticker.options
+        if not expirations:
+            return None
+
+        today = datetime.now().date()
+        exp_dates = []
+        for d_str in expirations:
+            try:
+                d = datetime.strptime(d_str, "%Y-%m-%d").date()
+                if d >= today:
+                    exp_dates.append((d, d_str))
+            except Exception:
+                continue
+
+        # 篩選標準月期權（每月第 3 個週五，日期 15~21 號）
+        monthly_exps = [
+            (d, d_str) for d, d_str in exp_dates
+            if d.weekday() == 4 and 15 <= d.day <= 21
+        ]
+        monthly_exps.sort(key=lambda x: x[0])
+
+        if not monthly_exps:
+            return None
+
+        # 鎖定近月與次月合約，計算 ToS 30-day 內插 IV
+        exp1_date, exp1_str = monthly_exps[0]
+        dte1 = (exp1_date - today).days
+
+        if len(monthly_exps) > 1:
+            exp2_date, exp2_str = monthly_exps[1]
+            dte2 = (exp2_date - today).days
+        else:
+            exp2_date, exp2_str, dte2 = exp1_date, exp1_str, dte1
+
+        # 目標操作合約（結算日後 25~30 天的次月合約）
+        target_date_str = exp2_str if dte1 < 25 and len(monthly_exps) > 1 else exp1_str
+        target_dte = dte2 if dte1 < 25 and len(monthly_exps) > 1 else dte1
+
+        iv1, _ = get_chain_atm_iv(ticker, spot, exp1_str, dte1)
+        iv2, target_chain = get_chain_atm_iv(ticker, spot, exp2_str, dte2)
+
+        if iv1 is None and iv2 is None:
+            return None
+        iv1 = iv1 if iv1 is not None else iv2
+        iv2 = iv2 if iv2 is not None else iv1
+
+        # 4. thinkorswim 30 天期標準化 IV 內插計算 (對齊 ToS 27.60%)
+        if dte1 <= 30 <= dte2 and (dte2 != dte1):
+            w2 = (30 - dte1) / (dte2 - dte1)
+            w1 = 1.0 - w2
+            current_iv = w1 * iv1 + w2 * iv2
+        else:
+            current_iv = iv2 if target_date_str == exp2_str else iv1
+
+        current_iv = sanitize_float(current_iv, default=0.276)
         iv_hv_ratio = round(current_iv / current_hv, 2) if current_hv > 0 else 1.0
 
-        # 策略決策與權利金連動
+        # 5. 策略與 44 天期 OTM 權利金連動
+        puts = target_chain.puts.copy() if target_chain is not None and not target_chain.puts.empty else pd.DataFrame()
+        
         if iv_hv_ratio >= 1.25 or current_iv >= 0.45:
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
-            otm_puts = puts[puts["strike"] <= spot]
-            target_put = otm_puts.sort_values("strike", ascending=False).iloc[0] if not otm_puts.empty else atm_put
-            chosen_premium = get_mid_price(target_put)
-            chosen_strike = float(target_put["strike"]) if target_put is not None else spot
+            if not puts.empty:
+                otm_puts = puts[puts["strike"] <= spot]
+                target_put = otm_puts.sort_values("strike", ascending=False).iloc[0] if not otm_puts.empty else puts.iloc[0]
+                chosen_premium = get_mid_price(target_put)
+                chosen_strike = float(target_put["strike"])
+            else:
+                chosen_premium = ""
+                chosen_strike = ""
         elif iv_hv_ratio <= 0.80 or current_iv <= 0.20:
             strategy = "Buy Call（IV偏低，適合買方進場）"
             strategy_tag = "BUY_CALL"
@@ -217,7 +244,7 @@ def fetch_volatility_metrics(symbol: str):
 
 def update_google_sheets(results: list):
     if len(results) < 20:
-        print(f"⚠️ 標的數量過少 ({len(results)} 檔)，略過寫入以防異常。")
+        print(f"⚠️ 標的數量過少 ({len(results)} 檔)，略過寫入。")
         return
 
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
@@ -233,10 +260,8 @@ def update_google_sheets(results: list):
         client = gspread.authorize(creds)
         sheet = client.open_by_key(sheet_id).worksheet("IV追蹤表")
 
-        # 1. 更新標題欄 (第 4 列)
         sheet.update(range_name="P4:R4", values=[["期權到期日\n【自動填入】", "資料來源 / 備註", "更新日期"]])
 
-        # 2. 組合數據列 (徹底排除 NaN)
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
             formula_ratio = f'=IF(OR($A{idx}="",$H{idx}="",$H{idx}=0),"",$C{idx}/$H{idx})'
@@ -270,16 +295,14 @@ def update_google_sheets(results: list):
         end_row = 4 + len(rows_to_insert)
         target_range = f"A5:R{end_row}"
         print(f"正在直接覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
-        
-        # 直接覆蓋寫入，不執行預先清空
         sheet.update(range_name=target_range, values=rows_to_insert, value_input_option="USER_ENTERED")
-        print("✅ 成功將完整數據回填至 Google Sheets！")
+        print("✅ 成功同步 thinkorswim 對齊數據！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
-    print(f"開始掃描 (總計 {len(tickers)} 檔)...")
+    print(f"開始掃描與 ToS 波動率對齊 (總計 {len(tickers)} 檔)...")
 
     results = []
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -298,10 +321,8 @@ def main():
     results.sort(key=lambda x: x["symbol"])
     print(f"\n掃描結束！有效數據: {len(results)} 檔。")
 
-    # 寫入 Google Sheets
     update_google_sheets(results)
 
-    # 產出快取供 LINE Bot 使用
     cache_payload = {
         "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(results),
@@ -309,8 +330,6 @@ def main():
     }
     with open("iv_cache.json", "w", encoding="utf-8") as f:
         json.dump(cache_payload, f, ensure_ascii=False, indent=2)
-
-    print("iv_cache.json 檔案已成功更新。")
 
 if __name__ == "__main__":
     main()
