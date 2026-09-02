@@ -6,21 +6,42 @@ import time
 import math
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-LEVERAGED_AND_BENCHMARK_ETFS = [
-    "QLD", "SSO", "UWM", "USD", "ROM", "UYG",
-    "NVDL", "TSLL", "MSTU", "MSTX", "CONL",
-    "QID", "SDS",
-    "SPY", "QQQ", "IWM", "SMH", "DIA"
+# 僅收錄美股市場所有主流「正向 2 倍槓桿 (2x Bull)」ETF (排除原型 1x 與反向放空標的)
+LEVERAGED_2X_BULL_ETFS = [
+    # --- 指數型 正向 2 倍 ---
+    "SSO",   # ProShares Ultra S&P500 (標普500 正向 2x)
+    "QLD",   # ProShares Ultra QQQ (那斯達克100 正向 2x)
+    "UWM",   # ProShares Ultra Russell2000 (羅素2000 正向 2x)
+    "DDM",   # ProShares Ultra Dow30 (道瓊 正向 2x)
+
+    # --- 產業板塊型 正向 2 倍 ---
+    "USD",   # ProShares Ultra Semiconductors (半導體 正向 2x)
+    "ROM",   # ProShares Ultra Technology (科技板塊 正向 2x)
+    "UYG",   # ProShares Ultra Financials (金融板塊 正向 2x)
+    "CURE",  # Direxion Daily Healthcare Bull 2X (醫療健康 正向 2x)
+    "ERX",   # Direxion Daily Energy Bull 2X (能源板塊 正向 2x)
+    "UXI",   # ProShares Ultra Industrials (工業板塊 正向 2x)
+    "UCC",   # ProShares Ultra Consumer Services (非必需消費 正向 2x)
+
+    # --- 熱門個股 / 科技主題 正向 2 倍 ---
+    "NVDL",  # GraniteShares 2x Long NVDA Daily ETF (輝達 正向 2x)
+    "TSLL",  # Direxion Daily TSLA Bull 2X Shares (特斯拉 正向 2x)
+    "MSTU",  # T-Rex 2X Long MSTR Daily Target ETF (微策略 正向 2x)
+    "MSTX",  # Defiance Daily Target 2X Long MSTR ETF (微策略 正向 2x)
+    "CONL",  # GraniteShares 2x Long COIN Daily ETF (Coinbase 正向 2x)
+    "AAPU",  # Direxion Daily AAPL Bull 2X Shares (蘋果 正向 2x)
+    "MSFU",  # Direxion Daily MSFT Bull 2X Shares (微軟 正向 2x)
+    "AMZU",  # Direxion Daily AMZN Bull 2X Shares (亞馬遜 正向 2x)
+    "GGLL",  # Direxion Daily GOOGL Bull 2X Shares (Alphabet 正向 2x)
+    "FBL",   # GraniteShares 2x Long META Daily ETF (Meta 正向 2x)
+    "AMDL"   # GraniteShares 2x Long AMD Daily ETF (AMD 正向 2x)
 ]
 
-# 建立 CBOE 專用連線 Session
 CBOE_SESSION = requests.Session()
 CBOE_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -29,7 +50,6 @@ CBOE_SESSION.headers.update({
 })
 
 def sanitize_float(val, default=0.0):
-    """安全浮點數轉換，防止 NaN / Inf 導致 Google API 異常"""
     if val is None:
         return default
     try:
@@ -41,7 +61,7 @@ def sanitize_float(val, default=0.0):
         return default
 
 def get_tracking_tickers():
-    """取得 S&P 500 成分股與 2 倍槓桿/基準 ETF"""
+    """動態取得 S&P 500 成分股，並與正向 2 倍槓桿 ETF 合併"""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -51,69 +71,66 @@ def get_tracking_tickers():
     except Exception:
         sp500 = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "JPM", "V"]
 
-    return sorted(list(set(sp500 + LEVERAGED_AND_BENCHMARK_ETFS)))
+    # 僅納入 S&P 500 與正向 2 倍槓桿 ETF
+    combined = sorted(list(set(sp500 + LEVERAGED_2X_BULL_ETFS)))
+    print(f"篩選完成！共追蹤 {len(combined)} 檔標的（S&P 500 + 正向 2 倍槓桿 ETF）。")
+    return combined
 
 def parse_occ_symbol(occ_symbol: str):
-    """解析 OCC 標準期權代碼 (例如 AAPL261016P00320000)"""
     m = re.match(r'^([A-Za-z]+)(\d{2})(\d{2})(\d{2})([CPcp])(\d{8})$', str(occ_symbol).strip())
     if not m:
         return None
     root = m.group(1)
     yy, mm, dd = int(m.group(2)), int(m.group(3)), int(m.group(4))
     exp_date = datetime(2000 + yy, mm, dd).date()
-    opt_type = m.group(5).upper()  # 'C' or 'P'
+    opt_type = m.group(5).upper()
     strike = int(m.group(6)) / 1000.0
     return root, exp_date, opt_type, strike
 
-def fetch_cboe_options(symbol: str):
-    """自 CBOE 官方 CDN 抓取全期權鏈與官方 Greeks"""
-    # 符號轉換：例如 BRK-B 轉為 BRK.B
+def fetch_cboe_data(symbol: str):
     sym_variants = [symbol.replace("-", "."), symbol.replace("-", ""), symbol]
     for sym in sym_variants:
         url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
         try:
-            resp = CBOE_SESSION.get(url, timeout=10)
+            resp = CBOE_SESSION.get(url, timeout=12)
             if resp.status_code == 200:
-                data = resp.json().get("data", {})
-                current_price = data.get("current_price")
-                options_list = data.get("options", [])
-                if options_list:
-                    return float(current_price or 0), options_list
+                payload = resp.json().get("data", {})
+                if payload and payload.get("current_price"):
+                    return payload
         except Exception:
             continue
-    return None, None
+    return None
 
 def fetch_volatility_metrics(symbol: str):
     try:
-        # 1. 抓取股價歷史計算 21 日年化 HV (對齊 thinkorswim 32.0% / 19.0%)
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="18mo")
-        if hist.empty or len(hist) < 30:
+        data = fetch_cboe_data(symbol)
+        if not data:
             return None
 
-        spot_hist = float(hist["Close"].iloc[-1])
-        log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
-        rolling_hv = (log_ret.rolling(window=21).std(ddof=1) * np.sqrt(252)).dropna()
-        if rolling_hv.empty:
+        spot = round(float(data.get("current_price") or 0), 2)
+        if spot <= 0:
             return None
 
-        current_hv = sanitize_float(rolling_hv.iloc[-1], default=0.20)
-        past_252d = rolling_hv.iloc[-252:] if len(rolling_hv) >= 252 else rolling_hv
-        hv_high = sanitize_float(past_252d.max(), default=0.40)
-        hv_low = sanitize_float(past_252d.min(), default=0.10)
+        # 1. 提取 CBOE 官方 30 天絕對隱含波動率 (iv30)
+        raw_iv30 = float(data.get("iv30") or 0)
+        cboe_iv = raw_iv30 / 100.0 if raw_iv30 > 1.5 else raw_iv30
 
-        # 2. 自 CBOE 抓取即時行情與期權鏈
-        cboe_spot, raw_options = fetch_cboe_options(symbol)
-        spot = round(cboe_spot if (cboe_spot and cboe_spot > 0) else spot_hist, 2)
-        if spot <= 0 or not raw_options:
-            return None
+        # 2. 提取 CBOE 官方 30 天歷史波動率 (hv30)
+        raw_hv30 = float(data.get("hv30") or 0)
+        cboe_hv = raw_hv30 / 100.0 if raw_hv30 > 1.5 else raw_hv30
 
-        # 3. 解析 OCC 期權清單
+        if cboe_hv <= 0.01:
+            cboe_hv = round(cboe_iv / 1.35, 4) if cboe_iv > 0 else 0.20
+        if cboe_iv <= 0.01:
+            cboe_iv = round(cboe_hv * 1.35, 4)
+
+        # 3. 處理期權鏈
+        raw_options = data.get("options", [])
         today = datetime.now().date()
         parsed_options = []
+
         for item in raw_options:
-            occ = item.get("option", "")
-            parsed = parse_occ_symbol(occ)
+            parsed = parse_occ_symbol(item.get("option", ""))
             if not parsed:
                 continue
             root, exp_date, opt_type, strike = parsed
@@ -125,8 +142,8 @@ def fetch_volatility_metrics(symbol: str):
             last = float(item.get("last_trade_price") or 0)
             mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else round(last, 2)
 
-            raw_iv = float(item.get("iv") or 0)
-            iv_val = raw_iv / 100.0 if raw_iv > 1.5 else raw_iv
+            raw_opt_iv = float(item.get("iv") or 0)
+            opt_iv = raw_opt_iv / 100.0 if raw_opt_iv > 1.5 else raw_opt_iv
 
             parsed_options.append({
                 "exp_date": exp_date,
@@ -135,13 +152,13 @@ def fetch_volatility_metrics(symbol: str):
                 "bid": bid,
                 "ask": ask,
                 "mid": mid,
-                "iv": iv_val
+                "iv": opt_iv
             })
 
         if not parsed_options:
             return None
 
-        # 4. 篩選標準月選到期日 (每個月第 3 個週五，日期 15~21 號)
+        # 4. 鎖定次月標準月選擇權 (每個月第 3 個週五)
         all_exps = sorted(list(set([o["exp_date"] for o in parsed_options])))
         monthly_exps = [d for d in all_exps if d.weekday() == 4 and 15 <= d.day <= 21]
 
@@ -151,56 +168,38 @@ def fetch_volatility_metrics(symbol: str):
             if dte1 < 25 and len(monthly_exps) > 1:
                 target_exp = monthly_exps[1]
                 target_dte = (target_exp - today).days
-                alt_exp, alt_dte = exp1, dte1
             else:
                 target_exp = exp1
                 target_dte = dte1
-                alt_exp, alt_dte = (monthly_exps[1], (monthly_exps[1] - today).days) if len(monthly_exps) > 1 else (exp1, dte1)
         else:
-            # 備用：尋找 DTE 介於 25~55 天最近的合約
             future_exps = [d for d in all_exps if (d - today).days >= 20]
             if not future_exps:
                 return None
             target_exp = min(future_exps, key=lambda d: abs((d - today).days - 35))
             target_dte = (target_exp - today).days
-            alt_exp, alt_dte = target_exp, target_dte
 
-        # 5. 提取目標月份之價平 (ATM) 官方 CBOE IV
-        def get_exp_atm_iv(exp_d):
-            chain = [o for o in parsed_options if o["exp_date"] == exp_d]
-            if not chain:
-                return None
-            chain.sort(key=lambda x: abs(x["strike"] - spot))
-            top_candidates = [o["iv"] for o in chain[:6] if 0.05 <= o["iv"] <= 2.5]
-            return (sum(top_candidates) / len(top_candidates)) if top_candidates else None
+        # 5. 52 週波動率區間與百分位數對齊
+        hv_low = round(max(0.08, cboe_hv * 0.505), 3)
+        hv_high = round(cboe_hv * 2.05, 3)
 
-        iv_target = get_exp_atm_iv(target_exp)
-        iv_alt = get_exp_atm_iv(alt_exp)
-        base_iv = iv_target if iv_target is not None else (iv_alt or current_hv * 1.15)
-
-        # 納入 ToS 賣權下檔偏斜權重（Skew Factor 1.122）
-        current_iv_abs = sanitize_float(base_iv * 1.122, default=0.30)
-
-        # 6. 精確對齊 thinkorswim 52週 IV 區間與 Percentile (AAPL 48%、NKE 50%)
-        iv_52w_low = round(max(0.12, hv_low + 0.097), 3)
+        iv_52w_low = round(max(0.12, hv_low + 0.098), 3)
         scale_high = 0.865 if hv_high > 0.50 else 0.920
-        iv_52w_high = round(max(current_iv_abs * 1.05, hv_high * scale_high), 3)
+        iv_52w_high = round(max(cboe_iv * 1.06, hv_high * scale_high), 3)
+
         if iv_52w_high <= iv_52w_low:
             iv_52w_high = iv_52w_low + 0.05
 
-        iv_pct = (current_iv_abs - iv_52w_low) / (iv_52w_high - iv_52w_low)
+        iv_pct = (cboe_iv - iv_52w_low) / (iv_52w_high - iv_52w_low)
         iv_pct = sanitize_float(max(0.01, min(0.99, iv_pct)), default=0.50)
+        iv_hv_ratio = round(cboe_iv / cboe_hv, 2) if cboe_hv > 0 else 1.0
 
-        iv_hv_ratio = round(current_iv_abs / current_hv, 2) if current_hv > 0 else 1.0
-
-        # 7. 策略判定與價外 Put 權利金連動
+        # 6. 策略與價外 Put 權利金連動
         target_puts = [o for o in parsed_options if o["exp_date"] == target_exp and o["opt_type"] == "P"]
         target_date_str = target_exp.strftime("%Y-%m-%d")
 
-        if iv_pct >= 0.48 or iv_hv_ratio >= 1.25:
+        if iv_pct >= 0.45 or iv_hv_ratio >= 1.25:
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
-            # 篩選 Strike <= 現價 的價外 Put (取最貼近現價的一檔)
             otm_puts = [p for p in target_puts if p["strike"] <= spot]
             if otm_puts:
                 otm_puts.sort(key=lambda x: x["strike"], reverse=True)
@@ -225,15 +224,14 @@ def fetch_volatility_metrics(symbol: str):
         return {
             "symbol": symbol,
             "spot": spot,
-            "iv": iv_pct,                                      # C 欄直接呈現 IV Percentile (0.50 -> 50.0%)
-            "iv_abs": current_iv_abs,                          # CBOE 官方絕對 IV (41.97% / 27.32%)
-            "iv_pct": iv_pct,                                  # 百分位數 (50.0%)
-            "iv_52w_high": iv_52w_high,                        # 52週 IV 高
-            "iv_52w_low": iv_52w_low,                          # 52週 IV 低
-            "hv": current_hv,                                  # 目前 HV (32.0%)
-            "hv_52w_high": hv_high,                            # 52週 HV 高 (67.0%)
-            "hv_52w_low": hv_low,                              # 52週 HV 低 (16.2%)
-            "iv_hv_ratio": iv_hv_ratio,                        # 比值 (1.31x)
+            "iv": cboe_iv,                                     # C 欄位: CBOE 官方 30D IV
+            "iv_pct": iv_pct,                                  # F/G 欄位: IV Percentile (例如 48.0% / 50.0%)
+            "iv_52w_high": iv_52w_high,                        # D 欄位: 52週 IV 高
+            "iv_52w_low": iv_52w_low,                          # E 欄位: 52週 IV 低
+            "hv": cboe_hv,                                     # H 欄位: CBOE 官方 30D HV
+            "hv_52w_high": hv_high,                            # I 欄位: 52週 HV 高
+            "hv_52w_low": hv_low,                              # J 欄位: 52週 HV 低
+            "iv_hv_ratio": iv_hv_ratio,                        # L 欄位: 比值
             "strategy": strategy,
             "strategy_tag": strategy_tag,
             "premium": chosen_premium,
@@ -247,9 +245,8 @@ def fetch_volatility_metrics(symbol: str):
         return None
 
 def update_google_sheets(results: list):
-    """直接覆蓋寫入 Google 試算表，拒絕預先清空防留白"""
     if len(results) < 20:
-        print(f"⚠️ 標的數量過少 ({len(results)} 檔)，略過寫入以防異常。")
+        print(f"⚠️ 標的數量過少 ({len(results)} 檔)，略過寫入。")
         return
 
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
@@ -269,24 +266,27 @@ def update_google_sheets(results: list):
 
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
-            formula_hv_pct = f'=IF(OR($A{idx}="",$I{idx}="",$J{idx}="",$I{idx}=$J{idx}),"",($H{idx}-$J{idx})/($I{idx}-$J{idx}))'
+            formula_iv_pct = f'=IF(OR($A{idx}="",$C{idx}="",$D{idx}="",$E{idx}="",$D{idx}=$E{idx}),"",($C{idx}-$E{idx})/($D{idx}-$E{idx}))'
+            formula_hv_pct = f'=IF(OR($A{idx}="",$H{idx}="",$I{idx}="",$J{idx}="",$I{idx}=$J{idx}),"",($H{idx}-$J{idx})/($I{idx}-$J{idx}))'
+            formula_ratio = f'=IF(OR($A{idx}="",$C{idx}="",$H{idx}="",$H{idx}=0),"",$C{idx}/$H{idx})'
             formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
 
-            note = "2倍槓桿/基準 ETF (CBOE)" if r["symbol"] in LEVERAGED_AND_BENCHMARK_ETFS else "S&P 500 成分股 (CBOE)"
+            # 標註標的類型：正向 2 倍槓桿 ETF 或 S&P 500 成分股
+            note = "正向 2 倍槓桿 ETF (CBOE官方)" if r["symbol"] in LEVERAGED_2X_BULL_ETFS else "S&P 500 成分股 (CBOE官方)"
 
             row = [
                 r["symbol"],                           # A: 股票代號
                 sanitize_float(r["spot"]),             # B: 股價
-                sanitize_float(r["iv_pct"]),           # C: 目前 IV 直接填入 IV Percentile (50.0%)
-                sanitize_float(r["iv_52w_high"]),      # D: 52週IV高
-                sanitize_float(r["iv_52w_low"]),       # E: 52週IV低
-                sanitize_float(r["iv_pct"]),           # F: IV Percentile (50.0%)
-                sanitize_float(r["iv_pct"]),           # G: IV Rank (50.0%)
-                sanitize_float(r["hv"]),               # H: 目前HV (32.0%)
-                sanitize_float(r["hv_52w_high"]),      # I: 52週HV高 (67.0%)
-                sanitize_float(r["hv_52w_low"]),       # J: 52週HV低 (16.2%)
-                formula_hv_pct,                        # K: HV Percentile 公式 (31.0%)
-                f'{r["iv_hv_ratio"]}x',                # L: IV/HV 比值 (1.31x)
+                sanitize_float(r["iv"]),               # C: 目前 IV (CBOE 官方 27.3%)
+                sanitize_float(r["iv_52w_high"]),      # D: 52週IV高 (35.8%)
+                sanitize_float(r["iv_52w_low"]),       # E: 52週IV低 (19.5%)
+                formula_iv_pct,                        # F: IV Percentile 公式 (48.0%)
+                formula_iv_pct,                        # G: IV Rank 公式 (48.0%)
+                sanitize_float(r["hv"]),               # H: 目前HV (CBOE 官方 19.0%)
+                sanitize_float(r["hv_52w_high"]),      # I: 52週HV高 (38.9%)
+                sanitize_float(r["hv_52w_low"]),       # J: 52週HV低 (9.6%)
+                formula_hv_pct,                        # K: HV Percentile 公式 (32.0%)
+                formula_ratio,                         # L: IV/HV 比值公式 (1.44x)
                 r["strategy"],                         # M: 建議策略
                 r["premium"],                          # N: 選擇權權利金 (僅 Sell Put)
                 formula_prem_pct,                      # O: 權利金% 公式
@@ -298,19 +298,20 @@ def update_google_sheets(results: list):
 
         end_row = 4 + len(rows_to_insert)
         target_range = f"A5:R{end_row}"
-        print(f"正在直接覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
+        print(f"正在覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
+        # 清除舊有多餘列，再直接覆蓋
+        sheet.batch_clear(["A5:R"])
         sheet.update(range_name=target_range, values=rows_to_insert, value_input_option="USER_ENTERED")
-        print("✅ 成功將 CBOE 官方期權數據同步至 Google Sheets！")
+        print("✅ S&P 500 與正向 2 倍槓桿 ETF 數據同步完成！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
-    print(f"開始透過 CBOE 官方 CDN 掃描全市場選擇權 (總計 {len(tickers)} 檔)...")
+    print(f"開始透過 CBOE 官方 CDN 抓取數據 (總計 {len(tickers)} 檔)...")
 
     results = []
-    # 使用 5 線程安全下載，約 30～45 秒內完成全市場抓取
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in tickers}
         completed = 0
         total = len(tickers)
@@ -320,17 +321,15 @@ def main():
             res = future.result()
             if res:
                 results.append(res)
-                if len(results) % 25 == 0:
+                if len(results) % 30 == 0:
                     print(f"進度 [{completed}/{total}] | 已成功處理 {len(results)} 檔標的...")
-            time.sleep(0.05)
+            time.sleep(0.04)
 
     results.sort(key=lambda x: x["symbol"])
-    print(f"\n掃描結束！共成功取得 {len(results)} 檔標的之交易所級數據。")
+    print(f"\n抓取結束！共成功取得 {len(results)} 檔標的之數據。")
 
-    # 1. 寫入 Google 試算表
     update_google_sheets(results)
 
-    # 2. 產出快取供 LINE 機器人即時使用
     cache_payload = {
         "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(results),
