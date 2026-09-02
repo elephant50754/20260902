@@ -1,50 +1,43 @@
 import os
+import io
 import json
 import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-def get_entire_us_market_tickers():
-    """
-    從 NASDAQ 官方交易所 FTP 伺服器動態下載全美股最新名單 (涵蓋 NYSE, NASDAQ, AMEX 11,000+ 檔)
-    """
-    print("正在從 NASDAQ 官方母名單下載全美股代碼清單...")
-    url = "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqtraded.txt"
+def get_sp500_tickers():
+    """從 Wikipedia 動態抓取最新 S&P 500 成分股名單"""
+    print("正在取得 S&P 500 最新成分股名單...")
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        df = pd.read_csv(url, sep="|")
-        # 過濾掉測試代碼 (Test Issue == 'Y') 與無效代碼
-        df = df[df["Test Issue"] == "N"]
-        raw_symbols = df["Symbol"].dropna().tolist()
-        
-        # 轉換為 Yahoo Finance 支援的代碼格式 (如 BRK.B 轉 BRK-B)
-        cleaned_symbols = [
-            str(s).strip().replace(".", "-").replace("$", "-")
-            for s in raw_symbols
-            if str(s).strip() != ""
-        ]
-        unique_symbols = sorted(list(set(cleaned_symbols)))
-        print(f"成功取得全美股掛牌名單，總計 {len(unique_symbols)} 檔標的。")
-        return unique_symbols
+        resp = requests.get(url, headers=headers, timeout=15)
+        tables = pd.read_html(io.StringIO(resp.text))
+        sp500_table = tables[0]
+        # 轉換為 Yahoo Finance 支援代碼 (如 BRK.B -> BRK-B)
+        tickers = [str(t).strip().replace(".", "-") for t in sp500_table["Symbol"].tolist()]
+        unique_tickers = sorted(list(set(tickers)))
+        print(f"成功取得 S&P 500 清單，共 {len(unique_tickers)} 檔標的。")
+        return unique_tickers
     except Exception as e:
-        print(f"NASDAQ 名單下載失敗: {e}，改用備用核心指數名單...")
-        return ["AAPL", "NVDA", "MSFT", "AMZN", "TSLA", "META", "GOOGL", "SPY", "QQQ", "IWM"]
+        print(f"取得 S&P 500 清單失敗: {e}，改用核心代表性標的...")
+        return [
+            "AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B",
+            "JPM", "V", "UNH", "XOM", "JNJ", "PG", "HD", "COST", "AMD", "NFLX"
+        ]
 
-def process_single_stock(symbol: str):
-    """處理單一股票：計算 HV、IV、比值與策略"""
+def fetch_volatility_metrics(symbol: str):
+    """計算單一標的的現價、HV、IV、價平權利金與建議策略"""
     try:
         ticker = yf.Ticker(symbol)
-        
-        # 1. 快速檢查是否具備選擇權 (若無選擇權則直接跳過，大幅節省時間)
-        expirations = ticker.options
-        if not expirations:
-            return None
 
-        # 2. 抓取歷史價格計算 30天年化歷史波動率 (HV)
+        # 1. 抓取歷史股價計算 30 天滾動年化歷史波動率 (HV)
         hist = ticker.history(period="1y")
         if hist.empty or len(hist) < 30:
             return None
@@ -64,57 +57,94 @@ def process_single_stock(symbol: str):
         hv_52w_high = float(valid_hv.max())
         hv_52w_low = float(valid_hv.min())
 
-        # 3. 尋找最接近 30 天的平值 (ATM) IV
+        # 2. 抓取最接近 30 天到期的選擇權鏈
+        expirations = ticker.options
+        if not expirations:
+            return None
+
         today = datetime.now().date()
         exp_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in expirations]
         target_date = min(exp_dates, key=lambda d: abs((d - today).days - 30))
         target_date_str = target_date.strftime("%Y-%m-%d")
 
-        calls = ticker.option_chain(target_date_str).calls.copy()
-        if calls.empty:
+        chain = ticker.option_chain(target_date_str)
+        calls = chain.calls.copy()
+        puts = chain.puts.copy()
+        if calls.empty and puts.empty:
             return None
 
+        # 3. 尋找價平 (ATM) 履約價
         calls["diff"] = (calls["strike"] - spot).abs()
-        atm_call = calls.sort_values("diff").iloc[0]
-        current_iv = atm_call.get("impliedVolatility")
+        atm_call = calls.sort_values("diff").iloc[0] if not calls.empty else None
 
-        if current_iv is None or pd.isna(current_iv) or current_iv <= 0:
+        puts["diff"] = (puts["strike"] - spot).abs()
+        atm_put = puts.sort_values("diff").iloc[0] if not puts.empty else None
+
+        # 4. 提取 IV (優先取 Call/Put 的合理中間值，防止單一合約失真)
+        call_iv = float(atm_call.get("impliedVolatility", 0)) if atm_call is not None else 0
+        put_iv = float(atm_put.get("impliedVolatility", 0)) if atm_put is not None else 0
+
+        valid_ivs = [v for v in [call_iv, put_iv] if v > 0.05]
+        if not valid_ivs:
+            current_iv = call_iv if call_iv > 0 else put_iv
+        else:
+            current_iv = sum(valid_ivs) / len(valid_ivs)
+
+        if current_iv <= 0:
             return None
 
-        current_iv = float(current_iv)
-        iv_hv_ratio = round(current_iv / current_hv, 2) if current_hv > 0 else None
+        # 5. 計算價平合約權利金 Mid-Price = (Bid + Ask) / 2
+        def get_mid_price(opt_row):
+            if opt_row is None:
+                return 0.0
+            bid = float(opt_row.get("bid", 0))
+            ask = float(opt_row.get("ask", 0))
+            last = float(opt_row.get("lastPrice", 0))
+            if bid > 0 and ask > 0:
+                return round((bid + ask) / 2, 2)
+            return round(last, 2)
 
-        # 4. 決策策略標記 (對齊 Excel 表格規則)
+        call_mid = get_mid_price(atm_call)
+        put_mid = get_mid_price(atm_put)
+
+        # 6. 建議策略判斷
         if current_iv >= 0.50:
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
+            # 賣方策略對應填入價平 Put 權利金
+            premium = put_mid if put_mid > 0 else call_mid
         elif current_iv <= 0.25:
             strategy = "Buy Call（IV偏低，適合買方進場）"
             strategy_tag = "BUY_CALL"
+            # 買方策略對應填入價平 Call 權利金
+            premium = call_mid if call_mid > 0 else put_mid
         else:
             strategy = "觀望 / 中性（無明顯優勢）"
             strategy_tag = "NEUTRAL"
+            premium = call_mid if call_mid > 0 else put_mid
+
+        iv_hv_ratio = round(current_iv / current_hv, 2) if current_hv > 0 else None
 
         return {
             "symbol": symbol,
             "spot": spot,
-            "iv": round(current_iv * 100, 2),
-            "hv": round(current_hv * 100, 2),
-            "hv_52w_high": round(hv_52w_high * 100, 2),
-            "hv_52w_low": round(hv_52w_low * 100, 2),
+            "iv": current_iv,                              # 小數格式 (如 0.355)
+            "hv": current_hv,                              # 小數格式 (如 0.290)
+            "hv_52w_high": hv_52w_high,
+            "hv_52w_low": hv_52w_low,
             "iv_hv_ratio": iv_hv_ratio,
             "strategy": strategy,
             "strategy_tag": strategy_tag,
+            "premium": premium,                            # N 欄位：價平權利金
             "exp_date": target_date_str,
             "dte": (target_date - today).days,
-            "strike": float(atm_call["strike"]),
             "updated_date": datetime.now().strftime("%Y-%m-%d")
         }
     except Exception:
         return None
 
 def update_google_sheets(results: list):
-    """將全市場結果批次寫入 Google 試算表"""
+    """將 S&P 500 結果批次寫入 Google 試算表"""
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
     if not creds_json_str or not sheet_id:
@@ -129,48 +159,72 @@ def update_google_sheets(results: list):
         sheet = client.open_by_key(sheet_id).worksheet("IV追蹤表")
 
         rows_to_insert = []
-        for r in results:
+        for idx, r in enumerate(results, start=5):
+            # 數值保護防呆：確保寫入試算表時是正確的小數格式 (例如 0.285 顯示為 28.5%)
+            iv_val = r["iv"] / 100 if r["iv"] > 1.5 else r["iv"]
+            hv_val = r["hv"] / 100 if r["hv"] > 1.5 else r["hv"]
+            hv_h_val = r["hv_52w_high"] / 100 if r["hv_52w_high"] > 1.5 else r["hv_52w_high"]
+            hv_l_val = r["hv_52w_low"] / 100 if r["hv_52w_low"] > 1.5 else r["hv_52w_low"]
+
+            # O 欄位自動填入公式：權利金 ÷ 現價
+            formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
+
             row = [
-                r["symbol"], r["spot"], r["iv"] / 100, "", "", "", "",
-                r["hv"] / 100, r["hv_52w_high"] / 100, r["hv_52w_low"] / 100,
-                "", r["iv_hv_ratio"], r["strategy"], "", "",
-                "全美股官方清單掃描", r["updated_date"]
+                r["symbol"],           # A: 股票代號
+                r["spot"],             # B: 股價
+                round(iv_val, 4),      # C: 目前IV
+                "",                    # D: 52週IV高
+                "",                    # E: 52週IV低
+                "",                    # F: IV Percentile
+                "",                    # G: IV Rank
+                round(hv_val, 4),      # H: 目前HV
+                round(hv_h_val, 4),    # I: 52週HV高
+                round(hv_l_val, 4),    # J: 52週HV低
+                "",                    # K: HV Percentile
+                r["iv_hv_ratio"],      # L: IV/HV 比值
+                r["strategy"],         # M: 建議策略
+                r["premium"],          # N: 選擇權權利金 (價平合約 Mid-Price)
+                formula_prem_pct,      # O: 權利金% (公式自動計算)
+                "S&P 500 自動掃描",    # P: 資料來源 / 備註
+                r["updated_date"]      # Q: 更新日期
             ]
             rows_to_insert.append(row)
 
         print(f"準備寫入 Google Sheets (共 {len(rows_to_insert)} 筆)...")
-        # 清除先前資料並單次批次整批寫入
+        # 清除第 5 列以下舊資料並寫入新資料
         sheet.batch_clear(["A5:Q"])
         sheet.update("A5", rows_to_insert, value_input_option="USER_ENTERED")
-        print("成功將全美股具選擇權標的寫入 Google Sheets！")
+        print("成功將 S&P 500 數據與權利金寫入 Google Sheets！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
-    all_tickers = get_entire_us_market_tickers()
-    print(f"啟動全市場多線程並行掃描 (總池：{len(all_tickers)} 檔)...")
+    sp500_tickers = get_sp500_tickers()
+    print(f"開始多線程掃描 S&P 500 選擇權指標與價平權利金 (共 {len(sp500_tickers)} 檔)...")
 
     results = []
-    # 採用 6 個工作線程並發，兼顧掃描速度與避免觸發 Yahoo API 頻率限制
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_to_symbol = {executor.submit(process_single_stock, sym): sym for sym in all_tickers}
+    # 使用 8 個線程加速執行（500 檔約 2~3 分鐘可跑完）
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in sp500_tickers}
         completed_count = 0
-        total = len(all_tickers)
+        total = len(sp500_tickers)
 
         for future in as_completed(future_to_symbol):
             completed_count += 1
             res = future.result()
             if res:
                 results.append(res)
-                if len(results) % 50 == 0:
-                    print(f"進度 [{completed_count}/{total}] | 已找到 {len(results)} 檔具備選擇權標的...")
+                if len(results) % 25 == 0:
+                    print(f"進度 [{completed_count}/{total}] | 已處理 {len(results)} 檔標的...")
 
-    print(f"\n全市場掃描結束！全美股共計 {len(results)} 檔標的具備有效選擇權與 IV 數據。")
+    # 依股票代號排序
+    results.sort(key=lambda x: x["symbol"])
+    print(f"\nS&P 500 掃描結束！成功取得 {len(results)} 檔標的數據。")
 
-    # 1. 寫入 Google Sheets
+    # 1. 批次更新 Google Sheets (A5 ~ Q)
     update_google_sheets(results)
 
-    # 2. 寫入 iv_cache.json 快取檔案 (供 LINE 機器人即時過濾使用)
+    # 2. 存入 JSON 快取供 LINE 機器人互動查詢
     cache_payload = {
         "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(results),
@@ -179,7 +233,7 @@ def main():
     with open("iv_cache.json", "w", encoding="utf-8") as f:
         json.dump(cache_payload, f, ensure_ascii=False, indent=2)
 
-    print("已成功產出全美股 iv_cache.json 快取！")
+    print("已成功產出 iv_cache.json 快取檔案。")
 
 if __name__ == "__main__":
     main()
