@@ -10,8 +10,8 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = Flask(__name__)
 
-LINE_ACCESS_TOKEN = os.environ.get("GljncdN/bF54ozh82WI27GQrkGtVE//92jMlAp24uVHn2trsFcN/GPd3sho486F7c5AhrGHdAl2nFr9dI8td3T lmZqTdZzuWSJHat2txIOAmpULNASjGMi42HfOjZZtIch+fz4YjMnGoYxEwHET7EQdB04t89/1O/w1cDnyilFU=")
-LINE_CHANNEL_SECRET = os.environ.get("867b4901989935004985a248eb8bb7fc")
+LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GITHUB_CACHE_URL = os.environ.get(
     "GITHUB_CACHE_URL",
     "https://raw.githubusercontent.com/elephant50754/20260902/main/iv_cache.json"
