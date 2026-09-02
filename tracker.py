@@ -11,30 +11,17 @@ import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-# 僅保留正 2 倍 (2x)、反向 2 倍 (-2x) 與核心基準 ETF (已完全剔除 3 倍標的)
+# 僅保留正 2 倍 (2x)、反向 2 倍 (-2x) 與核心基準 ETF
 LEVERAGED_AND_BENCHMARK_ETFS = [
-    # --- 指數正 2 倍 (2x) ---
-    "QLD",   # ProShares Ultra QQQ (那斯達克100 正2)
-    "SSO",   # ProShares Ultra S&P500 (標普500 正2)
-    "UWM",   # ProShares Ultra Russell2000 (羅素2000 正2)
-    
-    # --- 行業/板塊正 2 倍 (2x) ---
-    "USD",   # ProShares Ultra Semiconductors (半導體 正2)
-    "ROM",   # ProShares Ultra Technology (科技 正2)
-    "UYG",   # ProShares Ultra Financials (金融 正2)
-    
-    # --- 熱門個股正 2 倍槓桿 ETF ---
-    "NVDL",  # GraniteShares 2x Long NVDA (輝達 正2)
-    "TSLL",  # Direxion Daily TSLA Bull 2X (特斯拉 正2)
-    "MSTU",  # T-Rex 2X Long MSTR (微策略 正2)
-    "MSTX",  # Defiance Daily Target 2X Long MSTR (微策略 正2)
-    "CONL",  # GraniteShares 2x Long COIN (Coinbase 正2)
-    
-    # --- 反向 2 倍避險型 (-2x) ---
-    "QID",   # ProShares UltraShort QQQ (那斯達克100 反2)
-    "SDS",   # ProShares UltraShort S&P500 (標普500 反2)
-    
-    # --- 核心基準指數 ETF ---
+    # 指數正 2 倍
+    "QLD", "SSO", "UWM",
+    # 板塊正 2 倍
+    "USD", "ROM", "UYG",
+    # 熱門個股正 2 倍
+    "NVDL", "TSLL", "MSTU", "MSTX", "CONL",
+    # 反向 2 倍避險
+    "QID", "SDS",
+    # 基準指數 ETF
     "SPY", "QQQ", "IWM", "SMH", "DIA"
 ]
 
@@ -46,8 +33,7 @@ def get_tracking_tickers():
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         tables = pd.read_html(io.StringIO(resp.text))
-        sp500_table = tables[0]
-        sp500_tickers = [str(t).strip().replace(".", "-") for t in sp500_table["Symbol"].tolist()]
+        sp500_tickers = [str(t).strip().replace(".", "-") for t in tables[0]["Symbol"].tolist()]
     except Exception as e:
         print(f"取得 S&P 500 清單失敗: {e}，使用核心代表性標的...")
         sp500_tickers = [
@@ -55,17 +41,61 @@ def get_tracking_tickers():
             "JPM", "V", "UNH", "XOM", "JNJ", "PG", "HD", "COST", "AMD", "NFLX"
         ]
 
-    # 合併清單（去重複並排序）
     combined_tickers = sorted(list(set(sp500_tickers + LEVERAGED_AND_BENCHMARK_ETFS)))
-    print(f"清單整理完成！總計追蹤 {len(combined_tickers)} 檔標的 (S&P 500 + 2倍槓桿/基準 ETF)。")
+    print(f"清單整理完成！總計追蹤 {len(combined_tickers)} 檔標的。")
     return combined_tickers
 
+def select_target_monthly_expiration(expirations, today):
+    """
+    篩選標準月選擇權 (每個月第三個星期五，排除週期權)。
+    若當月結算日剩餘天數小於 25 天，自動順延至「結算日後 25~30 天」的下個月標準結算日。
+    """
+    if not expirations:
+        return None, None
+
+    exp_dates = []
+    for d_str in expirations:
+        try:
+            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            exp_dates.append((d, d_str))
+        except Exception:
+            continue
+
+    if not exp_dates:
+        return None, None
+
+    # 美股標準月選結算日：週五 (weekday == 4) 且日期落在 15~21 號之間
+    monthly_exps = [
+        (d, d_str) for d, d_str in exp_dates
+        if d.weekday() == 4 and 15 <= d.day <= 21 and d >= today
+    ]
+    monthly_exps.sort(key=lambda x: x[0])
+
+    if monthly_exps:
+        nearest_date, nearest_str = monthly_exps[0]
+        dte = (nearest_date - today).days
+
+        # 若當前月結算日小於 25 天（如 16 天），自動選擇下個月結算日（相距約 28 天）
+        if dte < 25 and len(monthly_exps) > 1:
+            target_date, target_str = monthly_exps[1]
+        else:
+            target_date, target_str = nearest_date, nearest_str
+    else:
+        # 備用邏輯：尋找最接近 30~45 天的有效合約
+        future_dates = [(d, d_str) for d, d_str in exp_dates if d >= today]
+        if not future_dates:
+            return None, None
+        target_date, target_str = min(future_dates, key=lambda x: abs((x[0] - today).days - 35))
+
+    target_dte = (target_date - today).days
+    return target_str, target_dte
+
 def fetch_volatility_metrics(symbol: str):
-    """計算單一標的的現價、HV、IV、價平權利金與建議策略"""
+    """計算單一標的現價、HV、月選 ATM IV、價平權利金與到期日"""
     try:
         ticker = yf.Ticker(symbol)
 
-        # 1. 抓取歷史股價計算 30 天滾動年化歷史波動率 (HV)
+        # 1. 歷史價格計算 30 天年化滾動 HV
         hist = ticker.history(period="1y")
         if hist.empty or len(hist) < 30:
             return None
@@ -85,15 +115,15 @@ def fetch_volatility_metrics(symbol: str):
         hv_52w_high = float(valid_hv.max())
         hv_52w_low = float(valid_hv.min())
 
-        # 2. 抓取最接近 30 天到期的選擇權鏈
+        # 2. 鎖定標準月結算日期權鏈
         expirations = ticker.options
         if not expirations:
             return None
 
         today = datetime.now().date()
-        exp_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in expirations]
-        target_date = min(exp_dates, key=lambda d: abs((d - today).days - 30))
-        target_date_str = target_date.strftime("%Y-%m-%d")
+        target_date_str, target_dte = select_target_monthly_expiration(expirations, today)
+        if not target_date_str:
+            return None
 
         chain = ticker.option_chain(target_date_str)
         calls = chain.calls.copy()
@@ -101,7 +131,7 @@ def fetch_volatility_metrics(symbol: str):
         if calls.empty and puts.empty:
             return None
 
-        # 3. 尋找價平 (ATM) 履約價
+        # 3. 尋找價平 (ATM) 合約
         calls["diff"] = (calls["strike"] - spot).abs()
         atm_call = calls.sort_values("diff").iloc[0] if not calls.empty else None
 
@@ -121,7 +151,7 @@ def fetch_volatility_metrics(symbol: str):
         if current_iv <= 0:
             return None
 
-        # 5. 計算價平合約權利金 Mid-Price = (Bid + Ask) / 2
+        # 5. 計算價平權利金 Mid-Price
         def get_mid_price(opt_row):
             if opt_row is None:
                 return 0.0
@@ -140,37 +170,42 @@ def fetch_volatility_metrics(symbol: str):
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
             premium = put_mid if put_mid > 0 else call_mid
+            strike = float(atm_put["strike"]) if atm_put is not None else spot
         elif current_iv <= 0.25:
             strategy = "Buy Call（IV偏低，適合買方進場）"
             strategy_tag = "BUY_CALL"
             premium = call_mid if call_mid > 0 else put_mid
+            strike = float(atm_call["strike"]) if atm_call is not None else spot
         else:
             strategy = "觀望 / 中性（無明顯優勢）"
             strategy_tag = "NEUTRAL"
             premium = call_mid if call_mid > 0 else put_mid
+            strike = float(atm_call["strike"]) if atm_call is not None else spot
 
         iv_hv_ratio = round(current_iv / current_hv, 2) if current_hv > 0 else None
 
         return {
             "symbol": symbol,
             "spot": spot,
-            "iv": current_iv,                              # 小數格式
-            "hv": current_hv,                              # 小數格式
+            "iv": current_iv,
+            "hv": current_hv,
             "hv_52w_high": hv_52w_high,
             "hv_52w_low": hv_52w_low,
             "iv_hv_ratio": iv_hv_ratio,
             "strategy": strategy,
             "strategy_tag": strategy_tag,
-            "premium": premium,                            # N 欄位：價平權利金
+            "premium": premium,
+            "strike": strike,
             "exp_date": target_date_str,
-            "dte": (target_date - today).days,
+            "dte": target_dte,
+            "exp_info": f"{target_date_str} ({target_dte}天)",
             "updated_date": datetime.now().strftime("%Y-%m-%d")
         }
     except Exception:
         return None
 
 def update_google_sheets(results: list):
-    """將結果批次寫入 Google 試算表"""
+    """將結果批次寫入 Google 試算表（含期權到期日新欄位）"""
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
     if not creds_json_str or not sheet_id:
@@ -184,15 +219,17 @@ def update_google_sheets(results: list):
         client = gspread.authorize(creds)
         sheet = client.open_by_key(sheet_id).worksheet("IV追蹤表")
 
+        # 自動校正第 4 列的表頭名稱 (新增 P 欄期權到期日，Q、R 順延)
+        sheet.update("P4:R4", [["期權到期日\n【自動填入】", "資料來源 / 備註", "更新日期"]])
+
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
-            # 數值格式校正 (確保以小數寫入，讓 Google 試算表正確顯示為 %)
             iv_val = r["iv"] / 100 if r["iv"] > 1.5 else r["iv"]
             hv_val = r["hv"] / 100 if r["hv"] > 1.5 else r["hv"]
             hv_h_val = r["hv_52w_high"] / 100 if r["hv_52w_high"] > 1.5 else r["hv_52w_high"]
             hv_l_val = r["hv_52w_low"] / 100 if r["hv_52w_low"] > 1.5 else r["hv_52w_low"]
 
-            # O 欄位自動填入公式：權利金 ÷ 現價
+            # O 欄位公式：權利金 ÷ 現價
             formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
 
             note = "2倍槓桿/基準 ETF" if r["symbol"] in LEVERAGED_AND_BENCHMARK_ETFS else "S&P 500 成分股"
@@ -213,22 +250,23 @@ def update_google_sheets(results: list):
                 r["strategy"],         # M: 建議策略
                 r["premium"],          # N: 選擇權權利金 (價平合約 Mid-Price)
                 formula_prem_pct,      # O: 權利金% (公式自動計算)
-                note,                  # P: 資料來源 / 備註
-                r["updated_date"]      # Q: 更新日期
+                r["exp_info"],         # P: 【新增】期權到期日 (如 2026-10-16 (44天))
+                note,                  # Q: 資料來源 / 備註
+                r["updated_date"]      # R: 更新日期
             ]
             rows_to_insert.append(row)
 
         print(f"準備寫入 Google Sheets (共 {len(rows_to_insert)} 筆)...")
-        # 清除第 5 列以下舊資料並寫入新資料
-        sheet.batch_clear(["A5:Q"])
+        # 清除第 5 列以下資料並寫入
+        sheet.batch_clear(["A5:R"])
         sheet.update("A5", rows_to_insert, value_input_option="USER_ENTERED")
-        print("成功將 S&P 500 與 2 倍槓桿 ETF 數據寫入 Google Sheets！")
+        print("成功將數據與期權到期日寫入 Google Sheets！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
-    print(f"開始掃描選擇權指標與價平權利金 (共 {len(tickers)} 檔)...")
+    print(f"開始掃描標準月選指標與價平權利金 (共 {len(tickers)} 檔)...")
 
     results = []
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -247,10 +285,10 @@ def main():
     results.sort(key=lambda x: x["symbol"])
     print(f"\n掃描結束！成功取得 {len(results)} 檔標的數據。")
 
-    # 1. 批次更新 Google Sheets
+    # 1. 更新 Google Sheets
     update_google_sheets(results)
 
-    # 2. 存入 JSON 快取供 LINE 機器人即時過濾
+    # 2. 存入 JSON 快取供 LINE 機器人即時查詢
     cache_payload = {
         "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(results),
