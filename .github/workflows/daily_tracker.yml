@@ -1,0 +1,38 @@
+name: Daily IV Tracker & Google Sheets Sync
+
+on:
+  schedule:
+    # 每週二至週六 UTC 21:30 (台灣時間清晨 05:30，美股收盤後)
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch: # 支援在網頁上手動點擊立即執行
+
+permissions:
+  contents: write
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 簽出專案
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝相依套件
+        run: pip install -r requirements.txt
+
+      - name: 執行計算並寫入 Google Sheets
+        env:
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python tracker.py
+
+      - name: 自動保存快取檔案回 GitHub
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: 自動更新 IV 快取數據 [skip ci]"
+          file_pattern: "iv_cache.json"
