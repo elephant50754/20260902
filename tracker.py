@@ -19,6 +19,18 @@ LEVERAGED_AND_BENCHMARK_ETFS = [
     "SPY", "QQQ", "IWM", "SMH", "DIA"
 ]
 
+def sanitize_float(val, default=0.0):
+    """確保所有數值均為合法浮點數，徹底過濾 NaN 與 Inf，防止 Google API 報錯"""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return round(f, 4)
+    except (ValueError, TypeError):
+        return default
+
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -30,7 +42,7 @@ def bs_price(is_call: bool, S: float, K: float, T: float, r: float, sigma: float
     return (S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)) if is_call else (K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1))
 
 def implied_volatility_solver(is_call: bool, S: float, K: float, T: float, market_price: float, r: float = 0.045) -> float:
-    """從真實期權市價反推隱含波動率，解決 Yahoo API 傳回 0.001% 的 Bug"""
+    """從真實市場成交價反推隱含波動率 (IV)"""
     if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
         return 0.0
     intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
@@ -97,9 +109,7 @@ def select_target_monthly_expiration(expirations, today):
 def fetch_volatility_metrics(symbol: str):
     try:
         ticker = yf.Ticker(symbol)
-
-        # 1. 抓取 3 個月歷史（避免 Yahoo 429 封鎖）
-        hist = ticker.history(period="3mo")
+        hist = ticker.history(period="6mo")
         if hist.empty or len(hist) < 22:
             return None
 
@@ -108,17 +118,17 @@ def fetch_volatility_metrics(symbol: str):
         if spot <= 0:
             return None
 
-        # 2. 計算 21 個交易日（對齊 ToS 30天）年化 HV
+        # 21 個交易日年化 HV (對齊 thinkorswim 30 天期標準)
         log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
         rolling_hv = (log_ret.rolling(window=21).std() * np.sqrt(252)).dropna()
         if rolling_hv.empty:
             return None
 
-        current_hv = float(rolling_hv.iloc[-1])
-        hv_high = float(rolling_hv.max())
-        hv_low = float(rolling_hv.min())
+        current_hv = sanitize_float(rolling_hv.iloc[-1], default=0.25)
+        hv_high = sanitize_float(rolling_hv.max(), default=current_hv * 1.3)
+        hv_low = sanitize_float(rolling_hv.min(), default=current_hv * 0.7)
 
-        # 3. 抓取月期權鏈
+        # 取得標準月期權
         expirations = ticker.options
         if not expirations:
             return None
@@ -139,7 +149,7 @@ def fetch_volatility_metrics(symbol: str):
             b = float(row.get("bid", 0))
             a = float(row.get("ask", 0))
             l = float(row.get("lastPrice", 0))
-            return round((b + a) / 2, 2) if b > 0 and a > 0 else round(l, 2)
+            return round((b + a) / 2, 2) if (b > 0 and a > 0) else round(l, 2)
 
         calls["diff"] = (calls["strike"] - spot).abs()
         atm_call = calls.sort_values("diff").iloc[0] if not calls.empty else None
@@ -149,7 +159,7 @@ def fetch_volatility_metrics(symbol: str):
         atm_put = puts.sort_values("diff").iloc[0] if not puts.empty else None
         put_mid = get_mid_price(atm_put)
 
-        # 4. 反推真實 IV（修正 0.1% 異常）
+        # 計算真實 IV
         T = target_dte / 365.0
         c_iv = implied_volatility_solver(True, spot, float(atm_call["strike"]), T, call_mid) if atm_call is not None else 0.0
         p_iv = implied_volatility_solver(False, spot, float(atm_put["strike"]), T, put_mid) if atm_put is not None else 0.0
@@ -160,11 +170,13 @@ def fetch_volatility_metrics(symbol: str):
         else:
             raw_c = float(atm_call.get("impliedVolatility", 0)) if atm_call is not None else 0
             raw_p = float(atm_put.get("impliedVolatility", 0)) if atm_put is not None else 0
-            current_iv = max(raw_c, raw_p, 0.20)
+            raw_valid = [v for v in [raw_c, raw_p] if v > 0.05]
+            current_iv = sum(raw_valid) / len(raw_valid) if raw_valid else (current_hv * 1.05)
 
-        # 5. 策略與權利金連動
+        current_iv = sanitize_float(current_iv, default=0.25)
         iv_hv_ratio = round(current_iv / current_hv, 2) if current_hv > 0 else 1.0
 
+        # 策略決策與權利金連動
         if iv_hv_ratio >= 1.25 or current_iv >= 0.45:
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
@@ -175,7 +187,7 @@ def fetch_volatility_metrics(symbol: str):
         elif iv_hv_ratio <= 0.80 or current_iv <= 0.20:
             strategy = "Buy Call（IV偏低，適合買方進場）"
             strategy_tag = "BUY_CALL"
-            chosen_premium = ""  # Buy Call 不顯示
+            chosen_premium = ""
             chosen_strike = ""
         else:
             strategy = "觀望 / 中性（無明顯優勢）"
@@ -204,9 +216,8 @@ def fetch_volatility_metrics(symbol: str):
         return None
 
 def update_google_sheets(results: list):
-    # 安全保護機制：若因網路抖動導致抓取標的小於 30 檔，拒絕清空試算表
-    if len(results) < 30:
-        print(f"⚠️ 抓取到的標的過少 ({len(results)} 檔)，為保護試算表資料不予覆蓋。")
+    if len(results) < 20:
+        print(f"⚠️ 標的數量過少 ({len(results)} 檔)，略過寫入以防異常。")
         return
 
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
@@ -222,8 +233,10 @@ def update_google_sheets(results: list):
         client = gspread.authorize(creds)
         sheet = client.open_by_key(sheet_id).worksheet("IV追蹤表")
 
+        # 1. 更新標題欄 (第 4 列)
         sheet.update(range_name="P4:R4", values=[["期權到期日\n【自動填入】", "資料來源 / 備註", "更新日期"]])
 
+        # 2. 組合數據列 (徹底排除 NaN)
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
             formula_ratio = f'=IF(OR($A{idx}="",$H{idx}="",$H{idx}=0),"",$C{idx}/$H{idx})'
@@ -234,15 +247,15 @@ def update_google_sheets(results: list):
 
             row = [
                 r["symbol"],
-                r["spot"],
-                round(r["iv"], 4),
+                sanitize_float(r["spot"]),
+                sanitize_float(r["iv"]),
                 "",
                 "",
                 "",
                 formula_iv_rank,
-                round(r["hv"], 4),
-                round(r["hv_52w_high"], 4),
-                round(r["hv_52w_low"], 4),
+                sanitize_float(r["hv"]),
+                sanitize_float(r["hv_52w_high"]),
+                sanitize_float(r["hv_52w_low"]),
                 "",
                 formula_ratio,
                 r["strategy"],
@@ -254,19 +267,21 @@ def update_google_sheets(results: list):
             ]
             rows_to_insert.append(row)
 
-        print(f"正在寫入 Google Sheets ({len(rows_to_insert)} 筆)...")
-        sheet.batch_clear(["A5:R"])
-        sheet.update(range_name="A5", values=rows_to_insert, value_input_option="USER_ENTERED")
-        print("✅ 寫入完成！")
+        end_row = 4 + len(rows_to_insert)
+        target_range = f"A5:R{end_row}"
+        print(f"正在直接覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
+        
+        # 直接覆蓋寫入，不執行預先清空
+        sheet.update(range_name=target_range, values=rows_to_insert, value_input_option="USER_ENTERED")
+        print("✅ 成功將完整數據回填至 Google Sheets！")
     except Exception as e:
-        print(f"寫入失敗: {e}")
+        print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
     print(f"開始掃描 (總計 {len(tickers)} 檔)...")
 
     results = []
-    # 調降線程為 4，避免觸發 Yahoo 頻率限制
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in tickers}
         completed = 0
@@ -277,14 +292,16 @@ def main():
             res = future.result()
             if res:
                 results.append(res)
-                if len(results) % 20 == 0:
-                    print(f"進度 [{completed}/{total}] 已成功取得 {len(results)} 檔...")
+                if len(results) % 25 == 0:
+                    print(f"進度 [{completed}/{total}] | 已成功取得 {len(results)} 檔...")
 
     results.sort(key=lambda x: x["symbol"])
-    print(f"\n掃描完成，有效標的: {len(results)} 檔。")
+    print(f"\n掃描結束！有效數據: {len(results)} 檔。")
 
+    # 寫入 Google Sheets
     update_google_sheets(results)
 
+    # 產出快取供 LINE Bot 使用
     cache_payload = {
         "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(results),
@@ -292,6 +309,8 @@ def main():
     }
     with open("iv_cache.json", "w", encoding="utf-8") as f:
         json.dump(cache_payload, f, ensure_ascii=False, indent=2)
+
+    print("iv_cache.json 檔案已成功更新。")
 
 if __name__ == "__main__":
     main()
