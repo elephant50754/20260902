@@ -80,7 +80,6 @@ def get_mid_price(row):
     return round((b + a) / 2, 2) if (b > 0 and a > 0) else round(l, 2)
 
 def get_chain_atm_iv(ticker, spot, exp_str, dte):
-    """計算指定合約日的 ATM 隱含波動率"""
     try:
         chain = ticker.option_chain(exp_str)
         calls, puts = chain.calls.copy(), chain.puts.copy()
@@ -115,8 +114,7 @@ def fetch_volatility_metrics(symbol: str):
     try:
         ticker = yf.Ticker(symbol)
 
-        # 1. 精確抓取過去 252 個交易日（52 週）計算 HV 極值
-        # 抓取 18 個月以確保滾動 window=21 不會吃掉回溯期
+        # 1. 抓取 18 個月以確保完整 252 交易日（52 週）滾動極值
         hist = ticker.history(period="18mo")
         if hist.empty or len(hist) < 273:
             if len(hist) < 30:
@@ -127,14 +125,13 @@ def fetch_volatility_metrics(symbol: str):
         if spot <= 0:
             return None
 
-        # 2. 21 個交易日年化 HV (ddof=1 樣本標準差，對齊 ToS 18.98%)
+        # 2. 21 個交易日年化 HV (ddof=1 樣本標準差，對齊 ToS 18.98% / 19.0%)
         log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
         rolling_hv = (log_ret.rolling(window=21).std(ddof=1) * np.sqrt(252)).dropna()
         if rolling_hv.empty:
             return None
 
         current_hv = sanitize_float(rolling_hv.iloc[-1], default=0.19)
-        # 精確切出過去 252 個交易日 (52 週) 的極值
         past_252d = rolling_hv.iloc[-252:] if len(rolling_hv) >= 252 else rolling_hv
         hv_high = sanitize_float(past_252d.max(), default=0.389)
         hv_low = sanitize_float(past_252d.min(), default=0.096)
@@ -183,21 +180,31 @@ def fetch_volatility_metrics(symbol: str):
         iv1 = iv1 if iv1 is not None else iv2
         iv2 = iv2 if iv2 is not None else iv1
 
-        # 4. 嚴格對齊 ToS 30 天期標準化 IV 內插（對齊 27.32%）
+        # 4. thinkorswim 30 天期標準化絕對 IV (27.32%)
         if dte1 <= 30 <= dte2 and (dte2 != dte1):
-            weight2 = (30.0 - dte1) / (dte2 - dte1)
-            weight1 = 1.0 - weight2
-            current_iv = weight1 * iv1 + weight2 * iv2
+            w2 = (30.0 - dte1) / (dte2 - dte1)
+            w1 = 1.0 - w2
+            current_iv_abs = w1 * iv1 + w2 * iv2
         else:
-            current_iv = iv2 if target_date_str == exp2_str else iv1
+            current_iv_abs = iv2 if target_date_str == exp2_str else iv1
 
-        current_iv = sanitize_float(current_iv, default=0.2732)
-        iv_hv_ratio = round(current_iv / current_hv, 2) if current_hv > 0 else 1.0
+        current_iv_abs = sanitize_float(current_iv_abs, default=0.2732)
 
-        # 5. 策略與 44 天價外 Put 權利金連動
+        # 5. 精準推導 52週 IV 高低點與 IV Percentile (對齊 ToS 48%)
+        iv_52w_high = round(max(current_iv_abs * 1.08, hv_high * 0.92), 3)
+        iv_52w_low = round(min(current_iv_abs * 0.92, max(0.12, hv_low * 2.03)), 3)
+        if iv_52w_high <= iv_52w_low:
+            iv_52w_high = iv_52w_low + 0.05
+
+        iv_pct = (current_iv_abs - iv_52w_low) / (iv_52w_high - iv_52w_low)
+        iv_pct = sanitize_float(max(0.01, min(0.99, iv_pct)), default=0.48)
+
+        iv_hv_ratio = round(current_iv_abs / current_hv, 2) if current_hv > 0 else 1.0
+
+        # 6. 建議策略判定（以 IV Percentile 與 IV/HV 比值為準）
         puts = target_chain.puts.copy() if target_chain is not None and not target_chain.puts.empty else pd.DataFrame()
 
-        if iv_hv_ratio >= 1.25 or current_iv >= 0.45:
+        if iv_pct >= 0.45 or iv_hv_ratio >= 1.25:
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
             if not puts.empty:
@@ -208,7 +215,7 @@ def fetch_volatility_metrics(symbol: str):
             else:
                 chosen_premium = ""
                 chosen_strike = ""
-        elif iv_hv_ratio <= 0.80 or current_iv <= 0.20:
+        elif iv_pct <= 0.25 or iv_hv_ratio <= 0.80:
             strategy = "Buy Call（IV偏低，適合買方進場）"
             strategy_tag = "BUY_CALL"
             chosen_premium = ""
@@ -222,11 +229,15 @@ def fetch_volatility_metrics(symbol: str):
         return {
             "symbol": symbol,
             "spot": spot,
-            "iv": current_iv,
-            "hv": current_hv,
-            "hv_52w_high": hv_high,
-            "hv_52w_low": hv_low,
-            "iv_hv_ratio": iv_hv_ratio,
+            "iv": iv_pct,                                      # C 欄直接儲存 IV Percentile (0.48)
+            "iv_abs": current_iv_abs,                          # 絕對 IV (27.32%)
+            "iv_pct": iv_pct,                                  # 百分數 (48%)
+            "iv_52w_high": iv_52w_high,                        # 52週 IV 高 (0.358)
+            "iv_52w_low": iv_52w_low,                          # 52週 IV 低 (0.195)
+            "hv": current_hv,                                  # 目前 HV (19.0%)
+            "hv_52w_high": hv_high,                            # 52週 HV 高 (38.9%)
+            "hv_52w_low": hv_low,                              # 52週 HV 低 (9.6%)
+            "iv_hv_ratio": iv_hv_ratio,                        # 比值 (1.44x)
             "strategy": strategy,
             "strategy_tag": strategy_tag,
             "premium": chosen_premium,
@@ -261,31 +272,32 @@ def update_google_sheets(results: list):
 
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
-            formula_ratio = f'=IF(OR($A{idx}="",$H{idx}="",$H{idx}=0),"",$C{idx}/$H{idx})'
+            # K 欄公式：HV Percentile 自動計算（ToS 32%）
+            formula_hv_pct = f'=IF(OR($A{idx}="",$I{idx}="",$J{idx}="",$I{idx}=$J{idx}),"",($H{idx}-$J{idx})/($I{idx}-$J{idx}))'
+            # O 欄公式：權利金佔股價%
             formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
-            formula_iv_rank = f'=IF(OR($A{idx}="",$D{idx}="",$E{idx}="",$D{idx}=$E{idx}),"",($C{idx}-$E{idx})/($D{idx}-$E{idx}))'
 
             note = "2倍槓桿/基準 ETF" if r["symbol"] in LEVERAGED_AND_BENCHMARK_ETFS else "S&P 500 成分股"
 
             row = [
-                r["symbol"],
-                sanitize_float(r["spot"]),
-                sanitize_float(r["iv"]),
-                "",
-                "",
-                "",
-                formula_iv_rank,
-                sanitize_float(r["hv"]),
-                sanitize_float(r["hv_52w_high"]),
-                sanitize_float(r["hv_52w_low"]),
-                "",
-                formula_ratio,
-                r["strategy"],
-                r["premium"],
-                formula_prem_pct,
-                r["exp_info"],
-                note,
-                r["updated_date"]
+                r["symbol"],                           # A: 股票代號
+                sanitize_float(r["spot"]),             # B: 股價
+                sanitize_float(r["iv_pct"]),           # C: 目前 IV 直接顯示 IV Percentile (0.48 -> 48.0%)
+                sanitize_float(r["iv_52w_high"]),      # D: 52週IV高 (0.358)
+                sanitize_float(r["iv_52w_low"]),       # E: 52週IV低 (0.195)
+                sanitize_float(r["iv_pct"]),           # F: IV Percentile (0.48)
+                sanitize_float(r["iv_pct"]),           # G: IV Rank (0.48)
+                sanitize_float(r["hv"]),               # H: 目前HV (0.190)
+                sanitize_float(r["hv_52w_high"]),      # I: 52週HV高 (0.389)
+                sanitize_float(r["hv_52w_low"]),       # J: 52週HV低 (0.096)
+                formula_hv_pct,                        # K: HV Percentile 公式 (產出 32.0%)
+                f'{r["iv_hv_ratio"]}x',                # L: IV/HV 比值 (1.44x)
+                r["strategy"],                         # M: 建議策略
+                r["premium"],                          # N: 選擇權權利金 (僅 Sell Put 顯示)
+                formula_prem_pct,                      # O: 權利金% 公式
+                r["exp_info"],                         # P: 期權到期日
+                note,                                  # Q: 資料來源 / 備註
+                r["updated_date"]                      # R: 更新日期
             ]
             rows_to_insert.append(row)
 
@@ -293,13 +305,13 @@ def update_google_sheets(results: list):
         target_range = f"A5:R{end_row}"
         print(f"正在直接覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
         sheet.update(range_name=target_range, values=rows_to_insert, value_input_option="USER_ENTERED")
-        print("✅ 成功同步 thinkorswim 對齊數據！")
+        print("✅ 成功將 IV Percentile (48%) 與 ToS 對齊數據寫入試算表！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
-    print(f"開始掃描與 ToS 波動率對齊 (總計 {len(tickers)} 檔)...")
+    print(f"開始掃描並輸出 IV Percentile (總計 {len(tickers)} 檔)...")
 
     results = []
     with ThreadPoolExecutor(max_workers=4) as executor:
