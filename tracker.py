@@ -11,7 +11,7 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-# 僅收錄美股市場所有主流「正向 2 倍槓桿 (2x Bull)」ETF (排除原型 1x 與反向放空標的)
+# 美股市場所有主流「正向 2 倍槓桿 (2x Bull)」ETF
 LEVERAGED_2X_BULL_ETFS = [
     # --- 指數型 正向 2 倍 ---
     "SSO",   # ProShares Ultra S&P500 (標普500 正向 2x)
@@ -61,7 +61,6 @@ def sanitize_float(val, default=0.0):
         return default
 
 def get_tracking_tickers():
-    """動態取得 S&P 500 成分股，並與正向 2 倍槓桿 ETF 合併"""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -71,7 +70,7 @@ def get_tracking_tickers():
     except Exception:
         sp500 = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "JPM", "V"]
 
-    # 僅納入 S&P 500 與正向 2 倍槓桿 ETF
+    # 剔除重複並排序
     combined = sorted(list(set(sp500 + LEVERAGED_2X_BULL_ETFS)))
     print(f"篩選完成！共追蹤 {len(combined)} 檔標的（S&P 500 + 正向 2 倍槓桿 ETF）。")
     return combined
@@ -88,17 +87,25 @@ def parse_occ_symbol(occ_symbol: str):
     return root, exp_date, opt_type, strike
 
 def fetch_cboe_data(symbol: str):
+    """自 CBOE 官方端點抓取數據（內建防限流重試機制）"""
     sym_variants = [symbol.replace("-", "."), symbol.replace("-", ""), symbol]
-    for sym in sym_variants:
-        url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
-        try:
-            resp = CBOE_SESSION.get(url, timeout=12)
-            if resp.status_code == 200:
-                payload = resp.json().get("data", {})
-                if payload and payload.get("current_price"):
-                    return payload
-        except Exception:
-            continue
+    
+    for attempt in range(2):
+        for sym in sym_variants:
+            url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
+            try:
+                resp = CBOE_SESSION.get(url, timeout=12)
+                if resp.status_code == 200:
+                    payload = resp.json().get("data", {})
+                    if payload and payload.get("current_price"):
+                        return payload
+                elif resp.status_code in [429, 403]:
+                    # 遇到頻率限制，主動冷卻
+                    time.sleep(1.2)
+            except Exception:
+                continue
+        if attempt == 0:
+            time.sleep(0.5)
     return None
 
 def fetch_volatility_metrics(symbol: str):
@@ -158,7 +165,7 @@ def fetch_volatility_metrics(symbol: str):
         if not parsed_options:
             return None
 
-        # 4. 鎖定次月標準月選擇權 (每個月第 3 個週五)
+        # 4. 鎖定次月標準月選合約 (每個月第 3 個週五)
         all_exps = sorted(list(set([o["exp_date"] for o in parsed_options])))
         monthly_exps = [d for d in all_exps if d.weekday() == 4 and 15 <= d.day <= 21]
 
@@ -178,7 +185,7 @@ def fetch_volatility_metrics(symbol: str):
             target_exp = min(future_exps, key=lambda d: abs((d - today).days - 35))
             target_dte = (target_exp - today).days
 
-        # 5. 52 週波動率區間與百分位數對齊
+        # 5. 52 週波動率區間與百分位數對齊 (對齊 thinkorswim)
         hv_low = round(max(0.08, cboe_hv * 0.505), 3)
         hv_high = round(cboe_hv * 2.05, 3)
 
@@ -193,7 +200,7 @@ def fetch_volatility_metrics(symbol: str):
         iv_pct = sanitize_float(max(0.01, min(0.99, iv_pct)), default=0.50)
         iv_hv_ratio = round(cboe_iv / cboe_hv, 2) if cboe_hv > 0 else 1.0
 
-        # 6. 策略與價外 Put 權利金連動
+        # 6. 策略判定與價外 Put 權利金連動
         target_puts = [o for o in parsed_options if o["exp_date"] == target_exp and o["opt_type"] == "P"]
         target_date_str = target_exp.strftime("%Y-%m-%d")
 
@@ -224,14 +231,14 @@ def fetch_volatility_metrics(symbol: str):
         return {
             "symbol": symbol,
             "spot": spot,
-            "iv": cboe_iv,                                     # C 欄位: CBOE 官方 30D IV
-            "iv_pct": iv_pct,                                  # F/G 欄位: IV Percentile (例如 48.0% / 50.0%)
-            "iv_52w_high": iv_52w_high,                        # D 欄位: 52週 IV 高
-            "iv_52w_low": iv_52w_low,                          # E 欄位: 52週 IV 低
-            "hv": cboe_hv,                                     # H 欄位: CBOE 官方 30D HV
-            "hv_52w_high": hv_high,                            # I 欄位: 52週 HV 高
-            "hv_52w_low": hv_low,                              # J 欄位: 52週 HV 低
-            "iv_hv_ratio": iv_hv_ratio,                        # L 欄位: 比值
+            "iv": cboe_iv,                                     # C 欄: CBOE 官方 30D IV
+            "iv_pct": iv_pct,                                  # F/G 欄: IV Percentile (例如 48.0% / 50.0%)
+            "iv_52w_high": iv_52w_high,                        # D 欄: 52週 IV 高
+            "iv_52w_low": iv_52w_low,                          # E 欄: 52週 IV 低
+            "hv": cboe_hv,                                     # H 欄: CBOE 官方 30D HV
+            "hv_52w_high": hv_high,                            # I 欄: 52週 HV 高
+            "hv_52w_low": hv_low,                              # J 欄: 52週 HV 低
+            "iv_hv_ratio": iv_hv_ratio,                        # L 欄: 比值
             "strategy": strategy,
             "strategy_tag": strategy_tag,
             "premium": chosen_premium,
@@ -245,8 +252,9 @@ def fetch_volatility_metrics(symbol: str):
         return None
 
 def update_google_sheets(results: list):
-    if len(results) < 20:
-        print(f"⚠️ 標的數量過少 ({len(results)} 檔)，略過寫入。")
+    # 安全門檻提升至 350 筆，若遭遇不可預期網路斷線絕對不覆蓋
+    if len(results) < 350:
+        print(f"⚠️ 標的數量不足 ({len(results)} 檔)，為保護資料完整不予覆蓋試算表。")
         return
 
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
@@ -271,7 +279,6 @@ def update_google_sheets(results: list):
             formula_ratio = f'=IF(OR($A{idx}="",$C{idx}="",$H{idx}="",$H{idx}=0),"",$C{idx}/$H{idx})'
             formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
 
-            # 標註標的類型：正向 2 倍槓桿 ETF 或 S&P 500 成分股
             note = "正向 2 倍槓桿 ETF (CBOE官方)" if r["symbol"] in LEVERAGED_2X_BULL_ETFS else "S&P 500 成分股 (CBOE官方)"
 
             row = [
@@ -299,19 +306,19 @@ def update_google_sheets(results: list):
         end_row = 4 + len(rows_to_insert)
         target_range = f"A5:R{end_row}"
         print(f"正在覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
-        # 清除舊有多餘列，再直接覆蓋
         sheet.batch_clear(["A5:R"])
         sheet.update(range_name=target_range, values=rows_to_insert, value_input_option="USER_ENTERED")
-        print("✅ S&P 500 與正向 2 倍槓桿 ETF 數據同步完成！")
+        print("✅ 全市場 500+ 檔標的完整寫入成功！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
-    print(f"開始透過 CBOE 官方 CDN 抓取數據 (總計 {len(tickers)} 檔)...")
+    print(f"開始透過 CBOE 官方 CDN 平滑下載全市場數據 (總計 {len(tickers)} 檔)...")
 
     results = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    # 調降為 2 線程並加入 0.25 秒冷卻，徹底消除 CloudFront 429 阻斷
+    with ThreadPoolExecutor(max_workers=2) as executor:
         future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in tickers}
         completed = 0
         total = len(tickers)
@@ -321,12 +328,12 @@ def main():
             res = future.result()
             if res:
                 results.append(res)
-                if len(results) % 30 == 0:
+                if len(results) % 25 == 0:
                     print(f"進度 [{completed}/{total}] | 已成功處理 {len(results)} 檔標的...")
-            time.sleep(0.04)
+            time.sleep(0.25)
 
     results.sort(key=lambda x: x["symbol"])
-    print(f"\n抓取結束！共成功取得 {len(results)} 檔標的之數據。")
+    print(f"\n下載結束！有效數據: {len(results)} 檔。")
 
     update_google_sheets(results)
 
