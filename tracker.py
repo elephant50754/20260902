@@ -11,8 +11,35 @@ import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-def get_sp500_tickers():
-    """從 Wikipedia 動態抓取最新 S&P 500 成分股名單"""
+# 僅保留正 2 倍 (2x)、反向 2 倍 (-2x) 與核心基準 ETF (已完全剔除 3 倍標的)
+LEVERAGED_AND_BENCHMARK_ETFS = [
+    # --- 指數正 2 倍 (2x) ---
+    "QLD",   # ProShares Ultra QQQ (那斯達克100 正2)
+    "SSO",   # ProShares Ultra S&P500 (標普500 正2)
+    "UWM",   # ProShares Ultra Russell2000 (羅素2000 正2)
+    
+    # --- 行業/板塊正 2 倍 (2x) ---
+    "USD",   # ProShares Ultra Semiconductors (半導體 正2)
+    "ROM",   # ProShares Ultra Technology (科技 正2)
+    "UYG",   # ProShares Ultra Financials (金融 正2)
+    
+    # --- 熱門個股正 2 倍槓桿 ETF ---
+    "NVDL",  # GraniteShares 2x Long NVDA (輝達 正2)
+    "TSLL",  # Direxion Daily TSLA Bull 2X (特斯拉 正2)
+    "MSTU",  # T-Rex 2X Long MSTR (微策略 正2)
+    "MSTX",  # Defiance Daily Target 2X Long MSTR (微策略 正2)
+    "CONL",  # GraniteShares 2x Long COIN (Coinbase 正2)
+    
+    # --- 反向 2 倍避險型 (-2x) ---
+    "QID",   # ProShares UltraShort QQQ (那斯達克100 反2)
+    "SDS",   # ProShares UltraShort S&P500 (標普500 反2)
+    
+    # --- 核心基準指數 ETF ---
+    "SPY", "QQQ", "IWM", "SMH", "DIA"
+]
+
+def get_tracking_tickers():
+    """動態取得 S&P 500 成分股，並合併 2 倍槓桿與基準 ETF"""
     print("正在取得 S&P 500 最新成分股名單...")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -20,17 +47,18 @@ def get_sp500_tickers():
         resp = requests.get(url, headers=headers, timeout=15)
         tables = pd.read_html(io.StringIO(resp.text))
         sp500_table = tables[0]
-        # 轉換為 Yahoo Finance 支援代碼 (如 BRK.B -> BRK-B)
-        tickers = [str(t).strip().replace(".", "-") for t in sp500_table["Symbol"].tolist()]
-        unique_tickers = sorted(list(set(tickers)))
-        print(f"成功取得 S&P 500 清單，共 {len(unique_tickers)} 檔標的。")
-        return unique_tickers
+        sp500_tickers = [str(t).strip().replace(".", "-") for t in sp500_table["Symbol"].tolist()]
     except Exception as e:
-        print(f"取得 S&P 500 清單失敗: {e}，改用核心代表性標的...")
-        return [
+        print(f"取得 S&P 500 清單失敗: {e}，使用核心代表性標的...")
+        sp500_tickers = [
             "AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B",
             "JPM", "V", "UNH", "XOM", "JNJ", "PG", "HD", "COST", "AMD", "NFLX"
         ]
+
+    # 合併清單（去重複並排序）
+    combined_tickers = sorted(list(set(sp500_tickers + LEVERAGED_AND_BENCHMARK_ETFS)))
+    print(f"清單整理完成！總計追蹤 {len(combined_tickers)} 檔標的 (S&P 500 + 2倍槓桿/基準 ETF)。")
+    return combined_tickers
 
 def fetch_volatility_metrics(symbol: str):
     """計算單一標的的現價、HV、IV、價平權利金與建議策略"""
@@ -80,7 +108,7 @@ def fetch_volatility_metrics(symbol: str):
         puts["diff"] = (puts["strike"] - spot).abs()
         atm_put = puts.sort_values("diff").iloc[0] if not puts.empty else None
 
-        # 4. 提取 IV (優先取 Call/Put 的合理中間值，防止單一合約失真)
+        # 4. 提取 IV
         call_iv = float(atm_call.get("impliedVolatility", 0)) if atm_call is not None else 0
         put_iv = float(atm_put.get("impliedVolatility", 0)) if atm_put is not None else 0
 
@@ -111,12 +139,10 @@ def fetch_volatility_metrics(symbol: str):
         if current_iv >= 0.50:
             strategy = "Sell Put（IV偏高，適合賣方收權利金）"
             strategy_tag = "SELL_PUT"
-            # 賣方策略對應填入價平 Put 權利金
             premium = put_mid if put_mid > 0 else call_mid
         elif current_iv <= 0.25:
             strategy = "Buy Call（IV偏低，適合買方進場）"
             strategy_tag = "BUY_CALL"
-            # 買方策略對應填入價平 Call 權利金
             premium = call_mid if call_mid > 0 else put_mid
         else:
             strategy = "觀望 / 中性（無明顯優勢）"
@@ -128,8 +154,8 @@ def fetch_volatility_metrics(symbol: str):
         return {
             "symbol": symbol,
             "spot": spot,
-            "iv": current_iv,                              # 小數格式 (如 0.355)
-            "hv": current_hv,                              # 小數格式 (如 0.290)
+            "iv": current_iv,                              # 小數格式
+            "hv": current_hv,                              # 小數格式
             "hv_52w_high": hv_52w_high,
             "hv_52w_low": hv_52w_low,
             "iv_hv_ratio": iv_hv_ratio,
@@ -144,7 +170,7 @@ def fetch_volatility_metrics(symbol: str):
         return None
 
 def update_google_sheets(results: list):
-    """將 S&P 500 結果批次寫入 Google 試算表"""
+    """將結果批次寫入 Google 試算表"""
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
     if not creds_json_str or not sheet_id:
@@ -160,7 +186,7 @@ def update_google_sheets(results: list):
 
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
-            # 數值保護防呆：確保寫入試算表時是正確的小數格式 (例如 0.285 顯示為 28.5%)
+            # 數值格式校正 (確保以小數寫入，讓 Google 試算表正確顯示為 %)
             iv_val = r["iv"] / 100 if r["iv"] > 1.5 else r["iv"]
             hv_val = r["hv"] / 100 if r["hv"] > 1.5 else r["hv"]
             hv_h_val = r["hv_52w_high"] / 100 if r["hv_52w_high"] > 1.5 else r["hv_52w_high"]
@@ -168,6 +194,8 @@ def update_google_sheets(results: list):
 
             # O 欄位自動填入公式：權利金 ÷ 現價
             formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
+
+            note = "2倍槓桿/基準 ETF" if r["symbol"] in LEVERAGED_AND_BENCHMARK_ETFS else "S&P 500 成分股"
 
             row = [
                 r["symbol"],           # A: 股票代號
@@ -185,7 +213,7 @@ def update_google_sheets(results: list):
                 r["strategy"],         # M: 建議策略
                 r["premium"],          # N: 選擇權權利金 (價平合約 Mid-Price)
                 formula_prem_pct,      # O: 權利金% (公式自動計算)
-                "S&P 500 自動掃描",    # P: 資料來源 / 備註
+                note,                  # P: 資料來源 / 備註
                 r["updated_date"]      # Q: 更新日期
             ]
             rows_to_insert.append(row)
@@ -194,20 +222,19 @@ def update_google_sheets(results: list):
         # 清除第 5 列以下舊資料並寫入新資料
         sheet.batch_clear(["A5:Q"])
         sheet.update("A5", rows_to_insert, value_input_option="USER_ENTERED")
-        print("成功將 S&P 500 數據與權利金寫入 Google Sheets！")
+        print("成功將 S&P 500 與 2 倍槓桿 ETF 數據寫入 Google Sheets！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
-    sp500_tickers = get_sp500_tickers()
-    print(f"開始多線程掃描 S&P 500 選擇權指標與價平權利金 (共 {len(sp500_tickers)} 檔)...")
+    tickers = get_tracking_tickers()
+    print(f"開始掃描選擇權指標與價平權利金 (共 {len(tickers)} 檔)...")
 
     results = []
-    # 使用 8 個線程加速執行（500 檔約 2~3 分鐘可跑完）
     with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in sp500_tickers}
+        future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in tickers}
         completed_count = 0
-        total = len(sp500_tickers)
+        total = len(tickers)
 
         for future in as_completed(future_to_symbol):
             completed_count += 1
@@ -217,14 +244,13 @@ def main():
                 if len(results) % 25 == 0:
                     print(f"進度 [{completed_count}/{total}] | 已處理 {len(results)} 檔標的...")
 
-    # 依股票代號排序
     results.sort(key=lambda x: x["symbol"])
-    print(f"\nS&P 500 掃描結束！成功取得 {len(results)} 檔標的數據。")
+    print(f"\n掃描結束！成功取得 {len(results)} 檔標的數據。")
 
-    # 1. 批次更新 Google Sheets (A5 ~ Q)
+    # 1. 批次更新 Google Sheets
     update_google_sheets(results)
 
-    # 2. 存入 JSON 快取供 LINE 機器人互動查詢
+    # 2. 存入 JSON 快取供 LINE 機器人即時過濾
     cache_payload = {
         "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(results),
