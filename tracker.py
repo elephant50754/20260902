@@ -1,6 +1,5 @@
 import os
 import io
-import re
 import json
 import time
 import math
@@ -13,18 +12,36 @@ import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-LEVERAGED_AND_BENCHMARK_ETFS = [
-    "QLD", "SSO", "UWM", "DDM",
-    "USD", "ROM", "UYG", "CURE", "ERX", "UXI", "UCC",
-    "NVDL", "TSLL", "MSTU", "MSTX", "CONL", "AAPU", "MSFU", "AMZU", "GGLL", "FBL", "AMDL"
-]
+# 僅收錄美股市場所有主流「正向 2 倍槓桿 (2x Bull)」ETF
+LEVERAGED_2X_BULL_ETFS = [
+    # --- 指數型 正向 2 倍 ---
+    "SSO",   # ProShares Ultra S&P500 (標普500 正向 2x)
+    "QLD",   # ProShares Ultra QQQ (那斯達克100 正向 2x)
+    "UWM",   # ProShares Ultra Russell2000 (羅素2000 正向 2x)
+    "DDM",   # ProShares Ultra Dow30 (道瓊 正向 2x)
 
-CBOE_SESSION = requests.Session()
-CBOE_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.cboe.com/"
-})
+    # --- 產業板塊型 正向 2 倍 ---
+    "USD",   # ProShares Ultra Semiconductors (半導體 正向 2x)
+    "ROM",   # ProShares Ultra Technology (科技板塊 正向 2x)
+    "UYG",   # ProShares Ultra Financials (金融板塊 正向 2x)
+    "CURE",  # Direxion Daily Healthcare Bull 2X (醫療健康 正向 2x)
+    "ERX",   # Direxion Daily Energy Bull 2X (能源板塊 正向 2x)
+    "UXI",   # ProShares Ultra Industrials (工業板塊 正向 2x)
+    "UCC",   # ProShares Ultra Consumer Services (非必需消費 正向 2x)
+
+    # --- 熱門個股 / 科技主題 正向 2 倍 ---
+    "NVDL",  # GraniteShares 2x Long NVDA Daily ETF (輝達 正向 2x)
+    "TSLL",  # Direxion Daily TSLA Bull 2X Shares (特斯拉 正向 2x)
+    "MSTU",  # T-Rex 2X Long MSTR Daily Target ETF (微策略 正向 2x)
+    "MSTX",  # Defiance Daily Target 2X Long MSTR ETF (微策略 正向 2x)
+    "CONL",  # GraniteShares 2x Long COIN Daily ETF (Coinbase 正向 2x)
+    "AAPU",  # Direxion Daily AAPL Bull 2X Shares (蘋果 正向 2x)
+    "MSFU",  # Direxion Daily MSFT Bull 2X Shares (微軟 正向 2x)
+    "AMZU",  # Direxion Daily AMZN Bull 2X Shares (亞馬遜 正向 2x)
+    "GGLL",  # Direxion Daily GOOGL Bull 2X Shares (Alphabet 正向 2x)
+    "FBL",   # GraniteShares 2x Long META Daily ETF (Meta 正向 2x)
+    "AMDL"   # GraniteShares 2x Long AMD Daily ETF (AMD 正向 2x)
+]
 
 def sanitize_float(val, default=0.0):
     if val is None:
@@ -37,6 +54,35 @@ def sanitize_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_price(is_call: bool, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(0.0, S - K) if is_call else max(0.0, K - S)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return (S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)) if is_call else (K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1))
+
+def implied_volatility_solver(is_call: bool, S: float, K: float, T: float, market_price: float, r: float = 0.045) -> float:
+    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0.0
+    intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
+    if market_price <= intrinsic:
+        return 0.0
+
+    low, high = 0.01, 3.5
+    for _ in range(30):
+        mid = (low + high) / 2.0
+        p = bs_price(is_call, S, K, T, r, mid)
+        if abs(p - market_price) < 1e-4:
+            return mid
+        if p < market_price:
+            low = mid
+        else:
+            high = mid
+    return mid
+
 def get_tracking_tickers():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -47,201 +93,217 @@ def get_tracking_tickers():
     except Exception:
         sp500 = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "JPM", "V"]
 
-    return sorted(list(set(sp500 + LEVERAGED_AND_BENCHMARK_ETFS)))
+    combined = sorted(list(set(sp500 + LEVERAGED_2X_BULL_ETFS)))
+    print(f"篩選完成！共追蹤 {len(combined)} 檔標的（S&P 500 + 正向 2 倍槓桿 ETF）。")
+    return combined
 
-def parse_occ_symbol(occ_symbol: str):
-    m = re.match(r'^([A-Za-z]+)(\d{2})(\d{2})(\d{2})([CPcp])(\d{8})$', str(occ_symbol).strip())
-    if not m:
-        return None
-    root = m.group(1)
-    yy, mm, dd = int(m.group(2)), int(m.group(3)), int(m.group(4))
-    exp_date = datetime(2000 + yy, mm, dd).date()
-    opt_type = m.group(5).upper()
-    strike = int(m.group(6)) / 1000.0
-    return root, exp_date, opt_type, strike
+def get_mid_price(row):
+    if row is None:
+        return 0.0
+    b = float(row.get("bid", 0))
+    a = float(row.get("ask", 0))
+    l = float(row.get("lastPrice", 0))
+    return round((b + a) / 2, 2) if (b > 0 and a > 0) else round(l, 2)
 
-def fetch_cboe_data(symbol: str):
-    sym_variants = [symbol.replace("-", "."), symbol.replace("-", ""), symbol]
-    for attempt in range(2):
-        for sym in sym_variants:
-            url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
-            try:
-                resp = CBOE_SESSION.get(url, timeout=12)
-                if resp.status_code == 200:
-                    payload = resp.json().get("data", {})
-                    if payload and payload.get("current_price"):
-                        return payload
-                elif resp.status_code in [429, 403]:
-                    time.sleep(1.2)
-            except Exception:
-                continue
-        if attempt == 0:
-            time.sleep(0.5)
-    return None
+def select_target_monthly_expiration(expirations, today):
+    if not expirations:
+        return None, None
+
+    exp_dates = []
+    for d_str in expirations:
+        try:
+            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            if d >= today:
+                exp_dates.append((d, d_str))
+        except Exception:
+            continue
+
+    monthly_exps = [
+        (d, d_str) for d, d_str in exp_dates
+        if d.weekday() == 4 and 15 <= d.day <= 21
+    ]
+    monthly_exps.sort(key=lambda x: x[0])
+    if not monthly_exps:
+        future_dates = [(d, d_str) for d, d_str in exp_dates if d >= today]
+        if not future_dates:
+            return None, None
+        target_date, target_str = min(future_dates, key=lambda x: abs((x[0] - today).days - 35))
+        return target_str, (target_date - today).days
+
+    exp1_date, exp1_str = monthly_exps[0]
+    dte1 = (exp1_date - today).days
+
+    if len(monthly_exps) > 1:
+        exp2_date, exp2_str = monthly_exps[1]
+        dte2 = (exp2_date - today).days
+    else:
+        exp2_date, exp2_str, dte2 = exp1_date, exp1_str, dte1
+
+    target_date_str = exp2_str if dte1 < 25 and len(monthly_exps) > 1 else exp1_str
+    target_dte = dte2 if dte1 < 25 and len(monthly_exps) > 1 else dte1
+    return target_date_str, target_dte
+
+def get_chain_robust_iv(ticker, spot, exp_str, dte):
+    try:
+        chain = ticker.option_chain(exp_str)
+        calls, puts = chain.calls.copy(), chain.puts.copy()
+        if calls.empty and puts.empty:
+            return None, chain
+
+        T = dte / 365.0
+        iv_pool = []
+
+        if not calls.empty:
+            calls["diff"] = (calls["strike"] - spot).abs()
+            top_calls = calls.sort_values("diff").head(3)
+            for _, c_row in top_calls.iterrows():
+                mid = get_mid_price(c_row)
+                k = float(c_row["strike"])
+                iv_s = implied_volatility_solver(True, spot, k, T, mid)
+                iv_raw = float(c_row.get("impliedVolatility", 0))
+                for v in [iv_s, iv_raw]:
+                    if 0.08 <= v <= 2.5:
+                        iv_pool.append(v)
+
+        if not puts.empty:
+            puts["diff"] = (puts["strike"] - spot).abs()
+            top_puts = puts.sort_values("diff").head(3)
+            for _, p_row in top_puts.iterrows():
+                mid = get_mid_price(p_row)
+                k = float(p_row["strike"])
+                iv_s = implied_volatility_solver(False, spot, k, T, mid)
+                iv_raw = float(p_row.get("impliedVolatility", 0))
+                for v in [iv_s, iv_raw]:
+                    if 0.08 <= v <= 2.5:
+                        iv_pool.append(v)
+
+        if iv_pool:
+            iv_pool.sort()
+            trim_len = max(1, int(len(iv_pool) * 0.15))
+            valid_subset = iv_pool[trim_len:-trim_len] if len(iv_pool) > 4 else iv_pool
+            robust_iv = sum(valid_subset) / len(valid_subset)
+        else:
+            robust_iv = 0.25
+
+        return robust_iv, chain
+    except Exception:
+        return None, None
 
 def fetch_volatility_metrics(symbol: str):
-    try:
-        # 1. 自 CBOE 取得即時報價、iv30、hv30
-        data = fetch_cboe_data(symbol)
-        if not data:
-            return None
-
-        spot = round(float(data.get("current_price") or 0), 2)
-        if spot <= 0:
-            return None
-
-        raw_iv30 = float(data.get("iv30") or 0)
-        cboe_iv = raw_iv30 / 100.0 if raw_iv30 > 1.5 else raw_iv30
-
-        raw_hv30 = float(data.get("hv30") or 0)
-        cboe_hv = raw_hv30 / 100.0 if raw_hv30 > 1.5 else raw_hv30
-
-        if cboe_hv <= 0.01 or cboe_iv <= 0.01:
-            # 備用：透過 yfinance 補抓歷史資料計算精確 HV 滾動極值
+    for attempt in range(2):
+        try:
             ticker = yf.Ticker(symbol)
+
+            # 1. 抓取過去 18 個月完整日收盤價序列以回推 252 交易日歷史序列
             hist = ticker.history(period="18mo")
-            if not hist.empty and len(hist) > 30:
-                log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
-                rolling_hv = (log_ret.rolling(window=21).std(ddof=1) * np.sqrt(252)).dropna()
-                if not rolling_hv.empty:
-                    cboe_hv = float(rolling_hv.iloc[-1])
-                    past_252d = rolling_hv.iloc[-252:] if len(rolling_hv) >= 252 else rolling_hv
-                    hv_high, hv_low = float(past_252d.max()), float(past_252d.min())
-                else:
-                    hv_high, hv_low = cboe_hv * 2.1, cboe_hv * 0.45
-            else:
-                hv_high, hv_low = 0.60, 0.15
-        else:
-            hv_high = cboe_hv * 2.1
-            hv_low = max(0.08, cboe_hv * 0.45)
+            if hist.empty or len(hist) < 273:
+                if len(hist) < 35:
+                    return None
 
-        if cboe_iv <= 0.01:
-            cboe_iv = round(cboe_hv * 1.35, 4)
-
-        # 2. 處理期權鏈以取得期權到期日與 OTM Put 權利金
-        raw_options = data.get("options", [])
-        today = datetime.now().date()
-        parsed_options = []
-
-        for item in raw_options:
-            parsed = parse_occ_symbol(item.get("option", ""))
-            if not parsed:
-                continue
-            root, exp_date, opt_type, strike = parsed
-            if exp_date < today:
-                continue
-
-            bid = float(item.get("bid") or 0)
-            ask = float(item.get("ask") or 0)
-            last = float(item.get("last_trade_price") or 0)
-            mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else round(last, 2)
-
-            raw_opt_iv = float(item.get("iv") or 0)
-            opt_iv = raw_opt_iv / 100.0 if raw_opt_iv > 1.5 else raw_opt_iv
-
-            parsed_options.append({
-                "exp_date": exp_date,
-                "opt_type": opt_type,
-                "strike": strike,
-                "mid": mid,
-                "iv": opt_iv
-            })
-
-        if not parsed_options:
-            return None
-
-        all_exps = sorted(list(set([o["exp_date"] for o in parsed_options])))
-        monthly_exps = [d for d in all_exps if d.weekday() == 4 and 15 <= d.day <= 21]
-
-        if monthly_exps:
-            exp1 = monthly_exps[0]
-            dte1 = (exp1 - today).days
-            if dte1 < 25 and len(monthly_exps) > 1:
-                target_exp = monthly_exps[1]
-                target_dte = (target_exp - today).days
-            else:
-                target_exp = exp1
-                target_dte = dte1
-        else:
-            future_exps = [d for d in all_exps if (d - today).days >= 20]
-            if not future_exps:
+            spot = float(hist["Close"].iloc[-1])
+            spot = round(spot, 2)
+            if spot <= 0:
                 return None
-            target_exp = min(future_exps, key=lambda d: abs((d - today).days - 35))
-            target_dte = (target_exp - today).days
 
-        # 3. 嘉信 / ToS 動態邊界對齊模型（精確對齊 INTC 108.6% / 46.4% 與 AAPL 35.8% / 19.5%）
-        vol_ratio = cboe_iv / max(cboe_hv, 0.10)
-        iv_52w_low = round(max(0.15, hv_low * 1.02 + (0.05 if vol_ratio > 1.5 else 0.0), 0.464 if symbol == "INTC" else 0.0), 3)
-        iv_52w_high = round(max(cboe_iv * 1.15, hv_high * 0.95, 1.086 if symbol == "INTC" else 0.0), 3)
+            # 2. 計算全歷史過去 252 個交易日的 21 日滾動 HV 序列
+            log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
+            rolling_hv = (log_ret.rolling(window=21).std(ddof=1) * np.sqrt(252)).dropna()
+            if rolling_hv.empty:
+                return None
 
-        if symbol == "INTC":
-            iv_52w_high, iv_52w_low = 1.086, 0.464
-        elif symbol == "AAPL":
-            iv_52w_high, iv_52w_low = 0.358, 0.195
+            # 過去一年（252 個交易日）的完整 HV 序列
+            past_252d_hv = rolling_hv.iloc[-252:] if len(rolling_hv) >= 252 else rolling_hv
+            current_hv = float(past_252d_hv.iloc[-1])
 
-        if iv_52w_high <= iv_52w_low:
-            iv_52w_high = iv_52w_low + 0.10
+            hv_high = float(past_252d_hv.max())
+            hv_low = float(past_252d_hv.min())
 
-        # 計算 ToS IV Percentile (Rank)
-        iv_pct = (cboe_iv - iv_52w_low) / (iv_52w_high - iv_52w_low)
-        iv_pct = sanitize_float(max(0.01, min(0.99, iv_pct)), default=0.50)
-        iv_hv_ratio = round(cboe_iv / cboe_hv, 2) if cboe_hv > 0 else 1.0
+            # 3. 取得期權鏈並算出當前絕對 IV
+            expirations = ticker.options
+            if not expirations:
+                return None
 
-        # 4. 策略與權利金連動
-        target_puts = [o for o in parsed_options if o["exp_date"] == target_exp and o["opt_type"] == "P"]
-        target_date_str = target_exp.strftime("%Y-%m-%d")
+            today = datetime.now().date()
+            target_date_str, target_dte = select_target_monthly_expiration(expirations, today)
+            if not target_date_str or target_dte <= 0:
+                return None
 
-        if iv_pct >= 0.45 or iv_hv_ratio >= 1.25:
-            strategy = "Sell Put（IV偏高，適合賣方收權利金）"
-            strategy_tag = "SELL_PUT"
-            otm_puts = [p for p in target_puts if p["strike"] <= spot]
-            if otm_puts:
-                otm_puts.sort(key=lambda x: x["strike"], reverse=True)
-                chosen_put = otm_puts[0]
+            current_iv_raw, target_chain = get_chain_robust_iv(ticker, spot, target_date_str, target_dte)
+            if current_iv_raw is None or current_iv_raw <= 0.01:
+                current_iv_raw = current_hv * 1.35
+
+            current_iv_abs = sanitize_float(current_iv_raw, default=0.25)
+
+            # 4. 【核心演算法：天數比例 IV Percentile 嚴格統計回推】
+            # 用過去 252 個交易日中，回推每日 IV_t <= 目前 IV 的天數，除以總交易天數
+            vrp_ratio = current_iv_abs / current_hv if current_hv > 0 else 1.25
+            daily_iv_series = past_252d_hv * vrp_ratio
+
+            # 統計小於或等於當前 IV 的天數比例
+            days_below = (daily_iv_series <= current_iv_abs).sum()
+            total_days = len(daily_iv_series)
+            iv_percentile = sanitize_float(days_below / total_days, default=0.50)
+
+            # 52週 IV 高低點取回推序列的歷史最大與最小值
+            iv_52w_high = sanitize_float(daily_iv_series.max(), default=current_iv_abs * 1.2)
+            iv_52w_low = sanitize_float(daily_iv_series.min(), default=current_iv_abs * 0.8)
+
+            iv_hv_ratio = round(current_iv_abs / current_hv, 2) if current_hv > 0 else 1.0
+
+            # 5. 策略判定與 44 天價外 Put 權利金連動
+            puts = target_chain.puts.copy() if target_chain is not None and not target_chain.puts.empty else pd.DataFrame()
+
+            if iv_percentile >= 0.48 or iv_hv_ratio >= 1.25:
+                strategy = "Sell Put（IV偏高，適合賣方收權利金）"
+                strategy_tag = "SELL_PUT"
+                if not puts.empty:
+                    otm_puts = puts[puts["strike"] <= spot]
+                    target_put = otm_puts.sort_values("strike", ascending=False).iloc[0] if not otm_puts.empty else puts.iloc[0]
+                    chosen_premium = get_mid_price(target_put)
+                    chosen_strike = float(target_put["strike"])
+                else:
+                    chosen_premium = ""
+                    chosen_strike = ""
+            elif iv_percentile <= 0.25 or iv_hv_ratio <= 0.80:
+                strategy = "Buy Call（IV偏低，適合買方進場）"
+                strategy_tag = "BUY_CALL"
+                chosen_premium = ""
+                chosen_strike = ""
             else:
-                target_puts.sort(key=lambda x: abs(x["strike"] - spot))
-                chosen_put = target_puts[0] if target_puts else None
+                strategy = "觀望 / 中性（無明顯優勢）"
+                strategy_tag = "NEUTRAL"
+                chosen_premium = ""
+                chosen_strike = ""
 
-            chosen_premium = chosen_put["mid"] if chosen_put else ""
-            chosen_strike = chosen_put["strike"] if chosen_put else ""
-        elif iv_pct <= 0.25 or iv_hv_ratio <= 0.80:
-            strategy = "Buy Call（IV偏低，適合買方進場）"
-            strategy_tag = "BUY_CALL"
-            chosen_premium = ""
-            chosen_strike = ""
-        else:
-            strategy = "觀望 / 中性（無明顯優勢）"
-            strategy_tag = "NEUTRAL"
-            chosen_premium = ""
-            chosen_strike = ""
-
-        return {
-            "symbol": symbol,
-            "spot": spot,
-            "iv": iv_pct,                                      # C 欄: 輸出 IV Percentile (例如 INTC 20%)
-            "iv_abs": cboe_iv,                                 # 絕對 IV (INTC 58.78%)
-            "iv_pct": iv_pct,                                  # 百分位數
-            "iv_52w_high": iv_52w_high,                        # D 欄: 52週 IV 高 (INTC 108.6%)
-            "iv_52w_low": iv_52w_low,                          # E 欄: 52週 IV 低 (INTC 46.4%)
-            "hv": cboe_hv,                                     # H 欄: 目前 HV
-            "hv_52w_high": hv_high,                            # I 欄: 52週 HV 高
-            "hv_52w_low": hv_low,                              # J 欄: 52週 HV 低
-            "iv_hv_ratio": iv_hv_ratio,                        # L 欄: 比值
-            "strategy": strategy,
-            "strategy_tag": strategy_tag,
-            "premium": chosen_premium,
-            "strike": chosen_strike,
-            "exp_date": target_date_str,
-            "dte": target_dte,
-            "exp_info": f"{target_date_str} ({target_dte}天)",
-            "updated_date": datetime.now().strftime("%Y-%m-%d")
-        }
-    except Exception:
-        return None
+            return {
+                "symbol": symbol,
+                "spot": spot,
+                "iv": iv_percentile,                               # C 欄直接呈現天數統計之 IV Percentile (0~100%)
+                "iv_abs": current_iv_abs,                          # 絕對 IV
+                "iv_pct": iv_percentile,                           # 天數百分比
+                "iv_52w_high": iv_52w_high,                        # 52週 IV 高
+                "iv_52w_low": iv_52w_low,                          # 52週 IV 低
+                "hv": current_hv,                                  # 目前 HV
+                "hv_52w_high": hv_high,                            # 52週 HV 高
+                "hv_52w_low": hv_low,                              # 52週 HV 低
+                "iv_hv_ratio": iv_hv_ratio,                        # 比值
+                "strategy": strategy,
+                "strategy_tag": strategy_tag,
+                "premium": chosen_premium,
+                "strike": chosen_strike,
+                "exp_date": target_date_str,
+                "dte": target_dte,
+                "exp_info": f"{target_date_str} ({target_dte}天)",
+                "updated_date": datetime.now().strftime("%Y-%m-%d")
+            }
+        except Exception:
+            time.sleep(0.5)
+            continue
+    return None
 
 def update_google_sheets(results: list):
     if len(results) < 350:
-        print(f"⚠️ 標的數量不足 ({len(results)} 檔)，略過寫入。")
+        print(f"⚠️ 標的數量不足 ({len(results)} 檔)，略過寫入以防異常。")
         return
 
     creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
@@ -261,27 +323,30 @@ def update_google_sheets(results: list):
 
         rows_to_insert = []
         for idx, r in enumerate(results, start=5):
+            # K 欄公式：HV Percentile 自動計算
             formula_hv_pct = f'=IF(OR($A{idx}="",$I{idx}="",$J{idx}="",$I{idx}=$J{idx}),"",($H{idx}-$J{idx})/($I{idx}-$J{idx}))'
-            formula_ratio = f'=IF(OR($A{idx}="",$C{idx}="",$H{idx}="",$H{idx}=0),"",$C{idx}/$H{idx})'
+            # L 欄公式：IV/HV 比值自動計算
+            formula_ratio = f'{r["iv_hv_ratio"]}x'
+            # O 欄公式：權利金佔比
             formula_prem_pct = f'=IF(OR($A{idx}="",$N{idx}="",$B{idx}="",$B{idx}=0),"",$N{idx}/$B{idx})'
 
-            note = "正向 2 倍槓桿 ETF (ToS精準對齊)" if r["symbol"] in LEVERAGED_2X_BULL_ETFS else "S&P 500 成分股 (ToS精準對齊)"
+            note = "正向 2 倍槓桿 ETF (Yahoo天數統計)" if r["symbol"] in LEVERAGED_2X_BULL_ETFS else "S&P 500 成分股 (Yahoo天數統計)"
 
             row = [
                 r["symbol"],                           # A: 股票代號
                 sanitize_float(r["spot"]),             # B: 股價
-                sanitize_float(r["iv_pct"]),           # C: 目前 IV 直接填入 IV Percentile (INTC: 20%)
-                sanitize_float(r["iv_52w_high"]),      # D: 52週IV高 (INTC: 1.086)
-                sanitize_float(r["iv_52w_low"]),       # E: 52週IV低 (INTC: 0.464)
-                sanitize_float(r["iv_pct"]),           # F: IV Percentile (20%)
-                sanitize_float(r["iv_pct"]),           # G: IV Rank (20%)
+                sanitize_float(r["iv_pct"]),           # C: 目前 IV 直接填入天數佔比之 IV Percentile
+                sanitize_float(r["iv_52w_high"]),      # D: 52週IV高
+                sanitize_float(r["iv_52w_low"]),       # E: 52週IV低
+                sanitize_float(r["iv_pct"]),           # F: IV Percentile (天數百分比)
+                sanitize_float(r["iv_pct"]),           # G: IV Rank
                 sanitize_float(r["hv"]),               # H: 目前HV
                 sanitize_float(r["hv_52w_high"]),      # I: 52週HV高
                 sanitize_float(r["hv_52w_low"]),       # J: 52週HV低
                 formula_hv_pct,                        # K: HV Percentile 公式
-                f'{r["iv_hv_ratio"]}x',                # L: IV/HV 比值
+                formula_ratio,                         # L: IV/HV 比值
                 r["strategy"],                         # M: 建議策略
-                r["premium"],                          # N: 選擇權權利金
+                r["premium"],                          # N: 選擇權權利金 (僅 Sell Put)
                 formula_prem_pct,                      # O: 權利金% 公式
                 r["exp_info"],                         # P: 期權到期日
                 note,                                  # Q: 資料來源 / 備註
@@ -294,15 +359,16 @@ def update_google_sheets(results: list):
         print(f"正在直接覆蓋寫入 Google Sheets ({target_range}，共 {len(rows_to_insert)} 筆)...")
         sheet.batch_clear(["A5:R"])
         sheet.update(range_name=target_range, values=rows_to_insert, value_input_option="USER_ENTERED")
-        print("✅ ToS 精準百分位數同步完成！")
+        print("✅ 天數佔比型 IV Percentile 已成功同步至 Google Sheets！")
     except Exception as e:
         print(f"寫入 Google Sheets 失敗: {e}")
 
 def main():
     tickers = get_tracking_tickers()
-    print(f"開始透過 ToS 動態邊界模型處理全市場數據 (總計 {len(tickers)} 檔)...")
+    print(f"開始透過 Yahoo Finance 執行 252 交易日天數佔比 IV Percentile 運算 (總計 {len(tickers)} 檔)...")
 
     results = []
+    # 限制 2 線程並間隔 0.35 秒，保護 IP 防止 Yahoo 429 阻斷
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_to_symbol = {executor.submit(fetch_volatility_metrics, sym): sym for sym in tickers}
         completed = 0
@@ -314,8 +380,8 @@ def main():
             if res:
                 results.append(res)
                 if len(results) % 25 == 0:
-                    print(f"進度 [{completed}/{total}] | 已成功處理 {len(results)} 檔...")
-            time.sleep(0.25)
+                    print(f"進度 [{completed}/{total}] | 已成功處理 {len(results)} 檔標的...")
+            time.sleep(0.35)
 
     results.sort(key=lambda x: x["symbol"])
     print(f"\n處理結束！有效數據: {len(results)} 檔。")
